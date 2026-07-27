@@ -1,0 +1,24 @@
+# Configuration & Sensitive Files
+config.json
+.env
+
+# Python Compiled Bytecode & Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# VS Code Workspace Settings
+.vscode/
+
+# Local Diagnostic / Test Scripts
+test_aws.py
+
+# Virtual Environments (if added in the future)
+venv/
+.venv/
+env/
+
+# Operating System Files
+Thumbs.db
+.DS_Store
