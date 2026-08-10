@@ -6,7 +6,7 @@ import boto3
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QListWidget, QLabel, QPushButton, QMessageBox, QDialog, 
-    QStackedWidget, QLineEdit, QFileDialog
+    QStackedWidget, QLineEdit, QFileDialog, QSizePolicy, QSlider
 )
 from PyQt6.QtGui import QPixmap, QShortcut, QKeySequence
 from PyQt6.QtCore import Qt, QTimer
@@ -20,9 +20,7 @@ from auth import (
 
 
 class CognitoLoginDialog(QDialog):
-    """PyQt6 Login Dialog that handles Cognito User Pool authentication,
-    MFA challenge verification, and two-hop credential exchange.
-    """
+    """PyQt6 Login Dialog that handles Cognito User Pool authentication."""
     def __init__(self, config: AppConfig, parent=None):
         super().__init__(parent)
         self.config = config
@@ -30,11 +28,13 @@ class CognitoLoginDialog(QDialog):
         self._pending_session: str | None = None
         self._pending_username: str | None = None
 
-        self.setWindowTitle("S3 Viewer - Cognito Sign In")
-        self.setFixedSize(360, 220)
+        self.setWindowTitle("S3 Viewer - Sign In")
+        self.setFixedSize(280, 140) 
 
         self.stack = QStackedWidget(self)
         main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(5)
         main_layout.addWidget(self.stack)
 
         self._build_login_view()
@@ -43,6 +43,8 @@ class CognitoLoginDialog(QDialog):
     def _build_login_view(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
 
         layout.addWidget(QLabel("Username:"))
         self.username_input = QLineEdit()
@@ -55,7 +57,7 @@ class CognitoLoginDialog(QDialog):
         layout.addWidget(self.password_input)
 
         self.login_status = QLabel("")
-        self.login_status.setStyleSheet("color: red;")
+        self.login_status.setStyleSheet("color: red; font-size: 8pt;")
         layout.addWidget(self.login_status)
 
         self.btn_login = QPushButton("Sign In")
@@ -67,14 +69,16 @@ class CognitoLoginDialog(QDialog):
     def _build_mfa_view(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
 
-        layout.addWidget(QLabel("Enter 6-digit Authenticator (TOTP) Code:"))
+        layout.addWidget(QLabel("Enter 6-digit Authenticator Code:"))
         self.totp_input = QLineEdit()
         self.totp_input.returnPressed.connect(self._handle_mfa)
         layout.addWidget(self.totp_input)
 
         self.mfa_status = QLabel("")
-        self.mfa_status.setStyleSheet("color: red;")
+        self.mfa_status.setStyleSheet("color: red; font-size: 8pt;")
         layout.addWidget(self.mfa_status)
 
         self.btn_mfa = QPushButton("Verify Code")
@@ -154,13 +158,27 @@ class S3ImageSequenceViewer(QMainWindow):
         self.current_index = -1
         self.ratings = {}  
         self.current_sticky_rating = None  
-        
-        # List to store GPS/Chainage data sequentially 
         self.metadata_list = [] 
+        self.current_pixmap = QPixmap() 
 
-        # --- Playback Timer (4 frames per second = 250ms interval) ---
+        # --- Rating Color Palette (Red to Green Gradient) ---
+        self.rating_colors = {
+            1: "#D32F2F",   # Red
+            2: "#F4511E",   # Deep Orange
+            3: "#FB8C00",   # Orange
+            4: "#FFB300",   # Amber
+            5: "#FDD835",   # Dark Yellow
+            6: "#FFEE58",   # Yellow
+            7: "#D4E157",   # Lime
+            8: "#9CCC65",   # Yellow-Green
+            9: "#66BB6A",   # Light Green
+            10: "#00E676"   # Bright Green
+        }
+
+        # --- Playback Timer ---
+        self.current_fps = 10
         self.play_timer = QTimer(self)
-        self.play_timer.setInterval(250)
+        self.play_timer.setInterval(int(1000 / self.current_fps))
         self.play_timer.timeout.connect(self._auto_advance_frame)
         self.is_playing = False
         
@@ -174,6 +192,7 @@ class S3ImageSequenceViewer(QMainWindow):
         left_layout.setContentsMargins(0, 0, 0, 0)
         
         self.btn_load_rsp = QPushButton("Load GPS/Chainage RSP")
+        self.btn_load_rsp.setStyleSheet("background-color: #212121; color: white; font-weight: bold; font-size: 10pt; padding: 6px;")
         self.btn_load_rsp.clicked.connect(self.load_metadata_rsp)
         left_layout.addWidget(self.btn_load_rsp)
         
@@ -187,74 +206,107 @@ class S3ImageSequenceViewer(QMainWindow):
         # Right side: Maximized Image display and enlarged controls
         right_layout = QVBoxLayout()
         
+        # --- MASSIVE CURRENT RATING DISPLAY (Slightly Reduced Height) ---
+        self.current_rating_label = QLabel("UNRATED")
+        self.current_rating_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.current_rating_label.setMinimumHeight(45)
+        self.current_rating_label.setStyleSheet("font-size: 20pt; font-weight: bold; background-color: #424242; color: white; border-radius: 6px;")
+        right_layout.addWidget(self.current_rating_label)
+
         # Status Bar Header
         self.status_label = QLabel("Loading images from S3...")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_label.setStyleSheet("font-size: 11pt; font-weight: bold; padding: 4px;")
+        self.status_label.setStyleSheet("font-size: 10pt; font-weight: bold; padding: 2px;")
         right_layout.addWidget(self.status_label)
         
-        # Metadata Header (Chainage / GPS)
+        # Metadata Header (Chainage / GPS) - STARTS RED
         self.metadata_label = QLabel("Chainage: N/A | GPS: N/A")
         self.metadata_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.metadata_label.setStyleSheet("font-size: 11pt; color: #1565c0; font-weight: bold;")
+        self.metadata_label.setStyleSheet("font-size: 10pt; color: #d32f2f; font-weight: bold;") 
         right_layout.addWidget(self.metadata_label)
         
-        # Enlarged Image Viewport
+        # Enlarged Dynamic Image Viewport
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setMinimumSize(950, 600)
+        self.image_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.image_label.setMinimumSize(400, 300)
         self.image_label.setStyleSheet("background-color: black; color: white;")
         right_layout.addWidget(self.image_label, 1) 
         
-        # --- Large Rapid Rating Buttons (1 to 10) ---
+        # --- Rapid Rating Buttons (1 to 10) ---
         rating_container = QWidget()
         rating_group_layout = QHBoxLayout(rating_container)
-        rating_group_layout.setContentsMargins(0, 5, 0, 5)
+        rating_group_layout.setContentsMargins(0, 2, 0, 2)
         
-        rating_title = QLabel("<b>Rating:</b>")
-        rating_title.setStyleSheet("font-size: 13pt;")
+        rating_title = QLabel("<b>Set Rating:</b>")
+        rating_title.setStyleSheet("font-size: 11pt;")
         rating_group_layout.addWidget(rating_title)
         
         self.rating_buttons = []
         for score in range(1, 11):
             btn = QPushButton(str(score))
-            btn.setMinimumHeight(55) 
+            btn.setMinimumHeight(50) 
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus) 
             btn.clicked.connect(lambda checked, s=score: self.rate_current_image(s))
             rating_group_layout.addWidget(btn, 1) 
             self.rating_buttons.append(btn)
             
         self.btn_export = QPushButton("Export CSV")
-        self.btn_export.setMinimumHeight(55)
-        self.btn_export.setStyleSheet("font-size: 11pt; font-weight: bold;")
+        self.btn_export.setMinimumHeight(50)
+        self.btn_export.setStyleSheet("font-size: 10pt; font-weight: bold; background-color: #e0e0e0; color: black; border-radius: 6px;")
         self.btn_export.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_export.clicked.connect(self.export_ratings)
         rating_group_layout.addWidget(self.btn_export, 1)
         
         right_layout.addWidget(rating_container)
         
-        # Navigation & Playback Controls
+        # --- FPS Slider Section ---
+        fps_container = QWidget()
+        fps_layout = QVBoxLayout(fps_container)
+        fps_layout.setContentsMargins(0, 2, 0, 5) 
+        
+        self.fps_label = QLabel(f"<b>Playback Speed:</b> {self.current_fps} FPS")
+        self.fps_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.fps_label.setStyleSheet("font-size: 10pt;")
+        
+        self.fps_slider = QSlider(Qt.Orientation.Horizontal)
+        self.fps_slider.setMinimum(1)
+        self.fps_slider.setMaximum(30)
+        self.fps_slider.setValue(self.current_fps)
+        self.fps_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.fps_slider.setTickInterval(5)
+        self.fps_slider.valueChanged.connect(self._update_fps)
+        self.fps_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        
+        fps_layout.addWidget(self.fps_label)
+        fps_layout.addWidget(self.fps_slider)
+        
+        right_layout.addWidget(fps_container)
+        
+        # --- Navigation & Playback Controls (Bottom row) ---
         controls_layout = QHBoxLayout()
+        controls_layout.setContentsMargins(0, 0, 0, 5)
         
         self.btn_prev = QPushButton("<< Previous")
-        self.btn_prev.setMinimumHeight(40)
+        self.btn_prev.setMinimumHeight(35)
         self.btn_prev.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_prev.clicked.connect(self.prev_frame)
         
-        self.btn_play = QPushButton("▶ Play (4 FPS)")
-        self.btn_play.setMinimumHeight(40)
-        self.btn_play.setStyleSheet("font-weight: bold; font-size: 12pt; background-color: #2e7d32; color: white;")
+        self.btn_play = QPushButton(f"▶ Play ({self.current_fps} FPS)")
+        self.btn_play.setMinimumHeight(35)
+        self.btn_play.setStyleSheet("font-weight: bold; font-size: 11pt; background-color: #2e7d32; color: white;")
         self.btn_play.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_play.clicked.connect(self.toggle_playback)
         
         self.btn_next = QPushButton("Next >>")
-        self.btn_next.setMinimumHeight(40)
+        self.btn_next.setMinimumHeight(35)
         self.btn_next.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_next.clicked.connect(self.next_frame)
         
         controls_layout.addWidget(self.btn_prev)
         controls_layout.addWidget(self.btn_play)
         controls_layout.addWidget(self.btn_next)
+        
         right_layout.addLayout(controls_layout)
         
         main_layout.addLayout(right_layout, 1)
@@ -267,6 +319,26 @@ class S3ImageSequenceViewer(QMainWindow):
         
         # Fetch images on startup
         self.populate_image_list()
+
+    def showEvent(self, event):
+        """Ensures the image is correctly scaled the moment the window appears on screen."""
+        super().showEvent(event)
+        self._update_image_display()
+
+    def resizeEvent(self, event):
+        """Ensures the image dynamically scales to fit whenever the window is resized."""
+        self._update_image_display()
+        super().resizeEvent(event)
+
+    def _update_image_display(self):
+        """Scales the raw pixmap to perfectly fit the current QLabel size without distortion."""
+        if hasattr(self, 'current_pixmap') and not self.current_pixmap.isNull():
+            scaled_pixmap = self.current_pixmap.scaled(
+                self.image_label.size(), 
+                Qt.AspectRatioMode.KeepAspectRatio, 
+                Qt.TransformationMode.SmoothTransformation
+            )
+            self.image_label.setPixmap(scaled_pixmap)
 
     def _setup_shortcuts(self):
         """Binds keys globally to the window using QShortcut."""
@@ -281,10 +353,10 @@ class S3ImageSequenceViewer(QMainWindow):
         QShortcut(QKeySequence("0"), self, lambda checked=False: self.rate_current_image(10))
 
     def load_metadata_rsp(self):
-        """Parses the RSP file. Sequence '5280' holds the frame GPS data sequentially."""
+        """Parses the RSP file for Date, Filename, Chainage, Lat, Lng, and Alt."""
         start_dir = r"S:\RSP\RSP2026\TII Network Survey 2026\RSP TII Network Survey Data 2026"
         if not os.path.exists(start_dir):
-            start_dir = "" # Fallback if drive S: isn't mapped
+            start_dir = "" 
 
         path, _ = QFileDialog.getOpenFileName(self, "Select RSP File", start_dir, "RSP Files (*.rsp *.RSP)")
         if not path:
@@ -292,28 +364,41 @@ class S3ImageSequenceViewer(QMainWindow):
             
         try:
             self.metadata_list.clear()
+            filename_val = os.path.splitext(os.path.basename(path))[0].upper()
+            date_val = "Unknown"
             
-            # Read all text and split robustly to avoid Mac/Windows newline issues
             with open(path, 'r', encoding='utf-8-sig', errors='ignore') as f:
                 content = f.read()
                 lines = re.split(r'\r\n|\r|\n', content)
+                
                 for line in lines:
-                    if line.startswith("5280,"):
-                        parts = [p.strip() for p in line.split(',')]
-                        if len(parts) > 6:
-                            # Extract Chainage, Lat, and Lng
-                            chainage = parts[1]
-                            lat = parts[5]
-                            lng = parts[6]
-                            self.metadata_list.append({
-                                "Chainage": chainage,
-                                "Lat": lat,
-                                "Lng": lng
-                            })
+                    parts = [p.strip().replace('"', '') for p in line.split(',')]
+                    
+                    if line.startswith("5011,") and len(parts) >= 6:
+                        date_val = f"{parts[3]}/{parts[4]}/{parts[5]}"
+                    elif line.startswith("5003,") and len(parts) >= 4:
+                        filename_val = parts[3]
+                    elif line.startswith("5280,") and len(parts) > 7:
+                        try:
+                            chainage_km = float(parts[1])
+                            chainage_m = round(chainage_km * 1000, 3)
+                        except ValueError:
+                            chainage_m = 0.0
                             
+                        self.metadata_list.append({
+                            "Filename": filename_val,
+                            "Date": date_val,
+                            "Chainage": chainage_m,
+                            "Lat": parts[5],
+                            "Lng": parts[6],
+                            "Alt": parts[7]
+                        })
+                            
+            # Change label color from red to blue now that data is loaded
+            self.metadata_label.setStyleSheet("font-size: 10pt; color: #1565c0; font-weight: bold;")
+            
             QMessageBox.information(self, "Success", f"Loaded metadata for {len(self.metadata_list)} frames from RSP.")
             
-            # Refresh current image metadata if one is loaded
             if self.current_index >= 0:
                 self.load_image_by_index(self.current_index)
                 
@@ -372,7 +457,7 @@ class S3ImageSequenceViewer(QMainWindow):
             chainage = metadata.get("Chainage", "N/A")
             lat = metadata.get("Lat", "N/A")
             lng = metadata.get("Lng", "N/A")
-            self.metadata_label.setText(f"Chainage (km): {chainage} | GPS: {lat}, {lng}")
+            self.metadata_label.setText(f"Chainage (m): {chainage} | GPS: {lat}, {lng}")
         else:
             self.metadata_label.setText("Chainage: N/A | GPS: N/A")
 
@@ -381,37 +466,37 @@ class S3ImageSequenceViewer(QMainWindow):
             response = self.s3.get_object(Bucket=self.bucket_name, Key=key)
             image_data = response['Body'].read()
             
-            pixmap = QPixmap()
-            pixmap.loadFromData(image_data)
-            
-            scaled_pixmap = pixmap.scaled(
-                self.image_label.size(), 
-                Qt.AspectRatioMode.KeepAspectRatio, 
-                Qt.TransformationMode.SmoothTransformation
-            )
-            self.image_label.setPixmap(scaled_pixmap)
+            # Load raw image into memory and scale via dedicated display update method
+            self.current_pixmap.loadFromData(image_data)
+            self._update_image_display()
             
             current_rating = self.ratings.get(key, "Unrated")
-            self.status_label.setText(
-                f"Frame {self.current_index + 1} of {len(self.image_keys)} | {filename} | Current Rating: [{current_rating}]"
-            )
+            self.status_label.setText(f"Frame {self.current_index + 1} of {len(self.image_keys)} | {filename}")
             
             self._update_rating_buttons_ui(current_rating)
             
         except Exception as e:
             self.image_label.setText(f"Error loading image:\n{str(e)}")
 
+    def _update_fps(self, value):
+        """Updates the timer interval live based on slider value."""
+        self.current_fps = value
+        self.fps_label.setText(f"<b>Playback Speed:</b> {self.current_fps} FPS")
+        self.play_timer.setInterval(int(1000 / self.current_fps))
+        if not self.is_playing:
+            self.btn_play.setText(f"▶ Play ({self.current_fps} FPS)")
+
     def toggle_playback(self):
-        """Starts or stops 4 FPS playback."""
+        """Starts or stops playback at the current FPS."""
         if self.is_playing:
             self.play_timer.stop()
             self.is_playing = False
-            self.btn_play.setText("▶ Play (4 FPS)")
-            self.btn_play.setStyleSheet("font-weight: bold; font-size: 12pt; background-color: #2e7d32; color: white;")
+            self.btn_play.setText(f"▶ Play ({self.current_fps} FPS)")
+            self.btn_play.setStyleSheet("font-weight: bold; font-size: 11pt; background-color: #2e7d32; color: white;")
         else:
             self.is_playing = True
             self.btn_play.setText("⏸ Stop")
-            self.btn_play.setStyleSheet("font-weight: bold; font-size: 12pt; background-color: #c62828; color: white;")
+            self.btn_play.setStyleSheet("font-weight: bold; font-size: 11pt; background-color: #c62828; color: white;")
             self.play_timer.start()
 
     def _auto_advance_frame(self):
@@ -427,36 +512,48 @@ class S3ImageSequenceViewer(QMainWindow):
             return
             
         key = self.image_keys[self.current_index]
-        self.current_sticky_rating = score  # Carry this rating forward to future images
+        self.current_sticky_rating = score 
         self.ratings[key] = score
         self._update_rating_buttons_ui(score)
-        
-        filename = key.split('/')[-1]
-        self.status_label.setText(
-            f"Frame {self.current_index + 1} of {len(self.image_keys)} | {filename} | Current Rating: [{score}]"
-        )
 
     def _update_rating_buttons_ui(self, active_score):
-        """Highlights the active rating button with a bright color and resets others."""
+        """Highlights the active rating button and updates the large color-matched display."""
+        
+        # 1. Update Large Display Banner
+        if isinstance(active_score, int) and active_score in self.rating_colors:
+            color = self.rating_colors[active_score]
+            text_color = "white" if active_score <= 3 else "black"
+            self.current_rating_label.setText(f"CURRENT RATING: {active_score}")
+            self.current_rating_label.setStyleSheet(f"font-size: 24pt; font-weight: bold; background-color: {color}; color: {text_color}; border-radius: 6px;")
+        else:
+            self.current_rating_label.setText("UNRATED")
+            self.current_rating_label.setStyleSheet("font-size: 20pt; font-weight: bold; background-color: #424242; color: white; border-radius: 6px;")
+
+        # 2. Update the 1-10 Buttons
         for idx, btn in enumerate(self.rating_buttons, start=1):
+            base_color = self.rating_colors[idx]
+            btn_text_color = "white" if idx <= 3 else "black"
+            
             if idx == active_score:
-                btn.setStyleSheet("""
-                    QPushButton {
-                        font-size: 15pt; font-weight: bold; background-color: #1565c0; color: white;
-                        border: 3px solid #0d47a1; border-radius: 6px;
-                    }
+                # Active button gets larger font and a thick white border
+                btn.setStyleSheet(f"""
+                    QPushButton {{
+                        font-size: 18pt; font-weight: bold; background-color: {base_color}; color: {btn_text_color};
+                        border: 3px solid #ffffff; border-radius: 6px;
+                    }}
                 """)
             else:
-                btn.setStyleSheet("""
-                    QPushButton {
-                        font-size: 13pt; font-weight: bold; background-color: #f0f0f0; color: #212121;
-                        border: 2px solid #bdbdbd; border-radius: 6px;
-                    }
-                    QPushButton:hover { background-color: #e0e0e0; }
+                # Inactive buttons return to normal sizing with subtle borders
+                btn.setStyleSheet(f"""
+                    QPushButton {{
+                        font-size: 12pt; font-weight: bold; background-color: {base_color}; color: {btn_text_color};
+                        border: 1px solid #757575; border-radius: 6px;
+                    }}
+                    QPushButton:hover {{ border: 2px solid #ffffff; }}
                 """)
 
     def export_ratings(self):
-        """Exports ratings and matched metadata to a local CSV file."""
+        """Exports ratings, only recording rows where the rating changes to save space."""
         if not self.ratings:
             QMessageBox.information(self, "Export Ratings", "No images have been rated yet.")
             return
@@ -466,28 +563,55 @@ class S3ImageSequenceViewer(QMainWindow):
             try:
                 with open(path, 'w', newline='', encoding='utf-8') as f:
                     writer = csv.writer(f)
-                    writer.writerow(["Image_Key", "Filename", "Rating", "Chainage", "Lat", "Lng"])
                     
-                    for key, score in sorted(self.ratings.items()):
-                        filename = key.split('/')[-1]
+                    writer.writerow([
+                        "Filename", "Frame", "Chainage", "Lat", "Lng", "Alt", 
+                        "IG_E", "IG_N", "IG_Height", "ITM_E", "ITM_N", "ITM_Height", 
+                        "Date", "DistanceFromLastReading(m)", "Rating"
+                    ])
+                    
+                    last_written_rating = None
+                    last_written_chainage = None
+                    
+                    sorted_keys = sorted(self.ratings.keys())
+                    
+                    for key in sorted_keys:
+                        score = self.ratings[key]
                         
-                        # Find the index of this key to get the correct metadata
+                        if score == last_written_rating:
+                            continue
+                            
                         try:
                             idx = self.image_keys.index(key)
-                            if idx < len(self.metadata_list):
-                                metadata = self.metadata_list[idx]
-                            else:
-                                metadata = {}
+                            meta = self.metadata_list[idx] if idx < len(self.metadata_list) else {}
+                            frame_num = idx + 1
                         except ValueError:
-                            metadata = {}
+                            meta = {}
+                            frame_num = "N/A"
                         
-                        chainage = metadata.get("Chainage", "")
-                        lat = metadata.get("Lat", "")
-                        lng = metadata.get("Lng", "")
+                        filename = meta.get("Filename", "")
+                        chainage = meta.get("Chainage", 0.0)
+                        lat = meta.get("Lat", "")
+                        lng = meta.get("Lng", "")
+                        alt = meta.get("Alt", "")
+                        date_val = meta.get("Date", "")
                         
-                        writer.writerow([key, filename, score, chainage, lat, lng])
+                        if last_written_chainage is not None and isinstance(chainage, (int, float)):
+                            dist = round(abs(chainage - last_written_chainage), 3)
+                        else:
+                            dist = 0
+                            
+                        if isinstance(chainage, (int, float)):
+                            last_written_chainage = chainage
+                        last_written_rating = score
+                            
+                        writer.writerow([
+                            filename, frame_num, chainage, lat, lng, alt,
+                            "", "", "", "", "", "",  
+                            date_val, dist, score
+                        ])
                         
-                QMessageBox.information(self, "Export Successful", f"Saved ratings for {len(self.ratings)} images to:\n{path}")
+                QMessageBox.information(self, "Export Successful", f"Saved condensed ratings to:\n{path}")
             except Exception as e:
                 QMessageBox.critical(self, "Export Error", f"Failed to save CSV file:\n{str(e)}")
 
