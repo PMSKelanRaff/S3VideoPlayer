@@ -1,14 +1,15 @@
 import sys
+import csv
 import boto3
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QListWidget, QLabel, QPushButton, QMessageBox, QDialog, 
-    QStackedWidget, QLineEdit
+    QStackedWidget, QLineEdit, QFileDialog
 )
 from PyQt6.QtGui import QPixmap
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 
-# Import authentication and configuration modules from your local files
+# Import authentication and configuration modules from local files
 from config import load_config, AppConfig
 from auth import (
     AssumedCredentials, AuthError, MfaRequired,
@@ -30,7 +31,6 @@ class CognitoLoginDialog(QDialog):
         self.setWindowTitle("S3 Viewer - Cognito Sign In")
         self.setFixedSize(360, 220)
 
-        # QStackedWidget allows switching between standard Login and TOTP/MFA views
         self.stack = QStackedWidget(self)
         main_layout = QVBoxLayout(self)
         main_layout.addWidget(self.stack)
@@ -93,11 +93,9 @@ class CognitoLoginDialog(QDialog):
         self.btn_login.setEnabled(False)
 
         try:
-            # Step 1: Initiate auth with Cognito User Pool
             id_token = initiate_login(self.config, username, password)
             self._complete_authentication(id_token)
         except MfaRequired as mfa:
-            # Capture session details and switch stack view to TOTP screen
             self._pending_session = mfa.session
             self._pending_username = mfa.username
             self.stack.setCurrentIndex(1)
@@ -116,7 +114,6 @@ class CognitoLoginDialog(QDialog):
         self.btn_mfa.setEnabled(False)
 
         try:
-            # Step 2: Answer SOFTWARE_TOKEN_MFA challenge
             id_token = respond_to_mfa_challenge(
                 self.config, self._pending_username, self._pending_session, totp_code
             )
@@ -127,7 +124,6 @@ class CognitoLoginDialog(QDialog):
 
     def _complete_authentication(self, id_token: str):
         try:
-            # Step 3 & 4: Two-hop credential exchange (Identity Pool -> Cross-Account AssumeRole)
             self.credentials = sign_in_and_get_bucket_credentials(self.config, id_token)
             self.accept()
         except AuthError as err:
@@ -143,9 +139,9 @@ class S3ImageSequenceViewer(QMainWindow):
         self.bucket_name = config.bucket_name
         self.prefix = prefix
         
-        self.setWindowTitle("S3 Survey Image Viewer")
+        self.setWindowTitle("S3 Survey Image Viewer & Rapid Rating Tool")
 
-        # Initialize S3 Client using temporary cross-account assumed credentials
+        # Initialize S3 Client
         self.s3 = boto3.client(
             's3',
             region_name=self.config.bucket_region,
@@ -154,51 +150,125 @@ class S3ImageSequenceViewer(QMainWindow):
         
         self.image_keys = []
         self.current_index = -1
+        self.ratings = {}  # Format: { 'image_key': rating_int }
+        self.current_sticky_rating = None # Tracks the rating to carry forward
+
+        # --- Playback Timer (4 frames per second = 250ms interval) ---
+        self.play_timer = QTimer(self)
+        self.play_timer.setInterval(250)
+        self.play_timer.timeout.connect(self._auto_advance_frame)
+        self.is_playing = False
         
-        # 1. Setup UI Layout
+        # --- UI Setup ---
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
         
-        # Left side: Image List (Allows jumping to a specific frame)
+        # Left side: Compact Image List Sidebar
         self.image_list_widget = QListWidget()
+        self.image_list_widget.setMaximumWidth(180)  # Keep sidebar narrow
         self.image_list_widget.currentRowChanged.connect(self.load_image_by_index)
-        main_layout.addWidget(self.image_list_widget, 1)
+        main_layout.addWidget(self.image_list_widget, 0)
         
-        # Right side: Image display and controls
+        # Right side: Maximized Image display and enlarged controls
         right_layout = QVBoxLayout()
         
-        # Status Label (Shows Frame X of Y)
+        # Status Bar Header
         self.status_label = QLabel("Loading images from S3...")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_label.setStyleSheet("font-size: 11pt; font-weight: bold; padding: 4px;")
         right_layout.addWidget(self.status_label)
         
-        # Image Display Area
+        # Enlarged Image Viewport
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setMinimumSize(800, 600)
+        self.image_label.setMinimumSize(950, 650)
         self.image_label.setStyleSheet("background-color: black; color: white;")
-        right_layout.addWidget(self.image_label, 5)
+        right_layout.addWidget(self.image_label, 1)  # Stretch factor 1 fills viewport
         
-        # Controls (Next / Prev)
+        # --- Large Rapid Rating Buttons (1 to 10) ---
+        rating_container = QWidget()
+        rating_group_layout = QHBoxLayout(rating_container)
+        rating_group_layout.setContentsMargins(0, 5, 0, 5)
+        
+        rating_title = QLabel("<b>Rating:</b>")
+        rating_title.setStyleSheet("font-size: 13pt;")
+        rating_group_layout.addWidget(rating_title)
+        
+        self.rating_buttons = []
+        for score in range(1, 11):
+            btn = QPushButton(str(score))
+            btn.setMinimumHeight(55)  # Large hit target
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # Prevents key focus interference
+            btn.clicked.connect(lambda checked, s=score: self.rate_current_image(s))
+            rating_group_layout.addWidget(btn, 1)  # Equal expanding width
+            self.rating_buttons.append(btn)
+            
+        self.btn_export = QPushButton("Export CSV")
+        self.btn_export.setMinimumHeight(55)
+        self.btn_export.setStyleSheet("font-size: 11pt; font-weight: bold;")
+        self.btn_export.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_export.clicked.connect(self.export_ratings)
+        rating_group_layout.addWidget(self.btn_export, 1)
+        
+        right_layout.addWidget(rating_container)
+        
+        # Navigation & Playback Controls
         controls_layout = QHBoxLayout()
-        self.btn_prev = QPushButton("<< Previous Frame")
+        
+        self.btn_prev = QPushButton("<< Previous")
+        self.btn_prev.setMinimumHeight(40)
+        self.btn_prev.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_prev.clicked.connect(self.prev_frame)
         
-        self.btn_next = QPushButton("Next Frame >>")
+        self.btn_play = QPushButton("▶ Play (4 FPS)")
+        self.btn_play.setMinimumHeight(40)
+        self.btn_play.setStyleSheet("font-weight: bold; font-size: 12pt; background-color: #2e7d32; color: white;")
+        self.btn_play.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_play.clicked.connect(self.toggle_playback)
+        
+        self.btn_next = QPushButton("Next >>")
+        self.btn_next.setMinimumHeight(40)
+        self.btn_next.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_next.clicked.connect(self.next_frame)
         
         controls_layout.addWidget(self.btn_prev)
+        controls_layout.addWidget(self.btn_play)
         controls_layout.addWidget(self.btn_next)
         right_layout.addLayout(controls_layout)
         
-        main_layout.addLayout(right_layout, 3)
+        main_layout.addLayout(right_layout, 1)
         
-        # 2. Fetch all images on startup
+        # Reset button styles to default state
+        self._update_rating_buttons_ui(None)
+        
+        # Fetch images on startup
         self.populate_image_list()
-        
+
+    def keyPressEvent(self, event):
+        """Keyboard Shortcuts for rapid rating:
+        - Keys 1-9: Rate 1 through 9
+        - Key 0: Rate 10
+        - Spacebar: Play / Pause toggle
+        - Left / Right arrows: Navigate frames
+        """
+        key = event.key()
+        if Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
+            score = key - Qt.Key.Key_0
+            self.rate_current_image(score)
+        elif key == Qt.Key.Key_0:
+            self.rate_current_image(10)
+        elif key == Qt.Key.Key_Space:
+            self.toggle_playback()
+        elif key == Qt.Key.Key_Left:
+            self.prev_frame()
+        elif key == Qt.Key.Key_Right:
+            self.next_frame()
+        else:
+            super().keyPressEvent(event)
+
     def populate_image_list(self):
-        """Fetches all JPGs in the prefix, handling folders with >1000 files."""
+        """Fetches all JPGs under the prefix."""
         try:
             paginator = self.s3.get_paginator('list_objects_v2')
             pages = paginator.paginate(Bucket=self.bucket_name, Prefix=self.prefix)
@@ -210,44 +280,41 @@ class S3ImageSequenceViewer(QMainWindow):
                         if key.lower().endswith(('.jpg', '.jpeg')):
                             self.image_keys.append(key)
             
-            # Sort alphabetically/numerically based on the file path
             self.image_keys.sort()
             
             if not self.image_keys:
                 self.status_label.setText("No images found in this folder.")
                 return
                 
-            # Populate the UI list widget
             for key in self.image_keys:
                 filename = key.split('/')[-1]
                 self.image_list_widget.addItem(filename)
                 
-            self.status_label.setText(f"Found {len(self.image_keys)} images. Select one to begin.")
-            
-            # Automatically load the first image
+            self.status_label.setText(f"Loaded {len(self.image_keys)} images | Press Space to Play/Stop | Keys 1-0 to Rate")
             self.image_list_widget.setCurrentRow(0)
             
         except Exception as e:
             QMessageBox.critical(self, "S3 Error", f"Could not load bucket data: {str(e)}")
 
     def load_image_by_index(self, index):
-        """Downloads the image directly into memory and displays it."""
+        """Downloads and displays image, auto-applying active sticky rating if unrated."""
         if index < 0 or index >= len(self.image_keys):
             return
-            
+            S
         self.current_index = index
         key = self.image_keys[self.current_index]
         
+        # If unrated yet a sticky rating exists, auto-apply it to this new frame
+        if key not in self.ratings and self.current_sticky_rating is not None:
+            self.ratings[key] = self.current_sticky_rating
+            
         try:
-            # Fetch raw object bytes directly from S3
             response = self.s3.get_object(Bucket=self.bucket_name, Key=key)
             image_data = response['Body'].read()
             
-            # Load bytes directly into QPixmap
             pixmap = QPixmap()
             pixmap.loadFromData(image_data)
             
-            # Scale pixmap maintaining aspect ratio
             scaled_pixmap = pixmap.scaled(
                 self.image_label.size(), 
                 Qt.AspectRatioMode.KeepAspectRatio, 
@@ -256,10 +323,98 @@ class S3ImageSequenceViewer(QMainWindow):
             self.image_label.setPixmap(scaled_pixmap)
             
             filename = key.split('/')[-1]
-            self.status_label.setText(f"Frame {self.current_index + 1} of {len(self.image_keys)} | {filename}")
+            current_rating = self.ratings.get(key, "Unrated")
+            self.status_label.setText(
+                f"Frame {self.current_index + 1} of {len(self.image_keys)} | {filename} | Current Rating: [{current_rating}]"
+            )
+            
+            self._update_rating_buttons_ui(current_rating)
             
         except Exception as e:
             self.image_label.setText(f"Error loading image:\n{str(e)}")
+
+    def toggle_playback(self):
+        """Starts or stops 4 FPS playback."""
+        if self.is_playing:
+            self.play_timer.stop()
+            self.is_playing = False
+            self.btn_play.setText("▶ Play (4 FPS)")
+            self.btn_play.setStyleSheet("font-weight: bold; font-size: 12pt; background-color: #2e7d32; color: white;")
+        else:
+            self.is_playing = True
+            self.btn_play.setText("⏸ Stop")
+            self.btn_play.setStyleSheet("font-weight: bold; font-size: 12pt; background-color: #c62828; color: white;")
+            self.play_timer.start()
+
+    def _auto_advance_frame(self):
+        """Timer callback to move to next frame, pausing at sequence end."""
+        if self.current_index < len(self.image_keys) - 1:
+            self.image_list_widget.setCurrentRow(self.current_index + 1)
+        else:
+            self.toggle_playback()
+
+    def rate_current_image(self, score: int):
+        """Assigns a score (1-10) to the current frame and sets it as sticky going forward."""
+        if self.current_index < 0 or self.current_index >= len(self.image_keys):
+            return
+            
+        key = self.image_keys[self.current_index]
+        self.current_sticky_rating = score  # Carry this rating forward to future images
+        self.ratings[key] = score
+        self._update_rating_buttons_ui(score)
+        
+        filename = key.split('/')[-1]
+        self.status_label.setText(
+            f"Frame {self.current_index + 1} of {len(self.image_keys)} | {filename} | Current Rating: [{score}]"
+        )
+
+    def _update_rating_buttons_ui(self, active_score):
+        """Highlights the active rating button with a bright color and resets others."""
+        for idx, btn in enumerate(self.rating_buttons, start=1):
+            if idx == active_score:
+                btn.setStyleSheet("""
+                    QPushButton {
+                        font-size: 15pt;
+                        font-weight: bold;
+                        background-color: #1565c0;
+                        color: white;
+                        border: 3px solid #0d47a1;
+                        border-radius: 6px;
+                    }
+                """)
+            else:
+                btn.setStyleSheet("""
+                    QPushButton {
+                        font-size: 13pt;
+                        font-weight: bold;
+                        background-color: #f0f0f0;
+                        color: #212121;
+                        border: 2px solid #bdbdbd;
+                        border-radius: 6px;
+                    }
+                    QPushButton:hover {
+                        background-color: #e0e0e0;
+                    }
+                """)
+
+    def export_ratings(self):
+        """Exports ratings dictionary to a local CSV file."""
+        if not self.ratings:
+            QMessageBox.information(self, "Export Ratings", "No images have been rated yet.")
+            return
+            
+        path, _ = QFileDialog.getSaveFileName(self, "Save Ratings CSV", "survey_ratings.csv", "CSV Files (*.csv)")
+        if path:
+            try:
+                with open(path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["Image_Key", "Filename", "Rating"])
+                    for key, score in sorted(self.ratings.items()):
+                        filename = key.split('/')[-1]
+                        writer.writerow([key, filename, score])
+                QMessageBox.information(self, "Export Successful", f"Saved ratings for {len(self.ratings)} images to:\n{path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Export Error", f"Failed to save CSV file:\n{str(e)}")
 
     def next_frame(self):
         if self.current_index < len(self.image_keys) - 1:
@@ -273,24 +428,20 @@ class S3ImageSequenceViewer(QMainWindow):
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     
-    # Load configuration settings from config.json
     try:
         config = load_config("config.json")
     except Exception as err:
         QMessageBox.critical(None, "Configuration Error", f"Failed to load config.json:\n{err}")
         sys.exit(1)
         
-    # Launch Cognito Sign-In & MFA Dialog
     login_dialog = CognitoLoginDialog(config)
     if login_dialog.exec() != QDialog.DialogCode.Accepted:
-        sys.exit(0)  # User closed dialog or login failed
+        sys.exit(0)
         
-    # Target prefix folder path in S3
     PREFIX = '2026/RSP TII Network Survey Imagery 2026/WE20260606/N04D226C/N04D226C_ROW/'
     
-    # Launch main application window with authenticated temporary credentials
     viewer = S3ImageSequenceViewer(config, login_dialog.credentials, PREFIX)
-    viewer.resize(1200, 800)
+    viewer.resize(1450, 900)
     viewer.show()
     
     sys.exit(app.exec())
