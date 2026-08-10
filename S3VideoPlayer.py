@@ -1,12 +1,14 @@
 import sys
 import csv
+import os
+import re
 import boto3
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QListWidget, QLabel, QPushButton, QMessageBox, QDialog, 
     QStackedWidget, QLineEdit, QFileDialog
 )
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtGui import QPixmap, QShortcut, QKeySequence
 from PyQt6.QtCore import Qt, QTimer
 
 # Import authentication and configuration modules from local files
@@ -150,8 +152,11 @@ class S3ImageSequenceViewer(QMainWindow):
         
         self.image_keys = []
         self.current_index = -1
-        self.ratings = {}  # Format: { 'image_key': rating_int }
-        self.current_sticky_rating = None # Tracks the rating to carry forward
+        self.ratings = {}  
+        self.current_sticky_rating = None  
+        
+        # List to store GPS/Chainage data sequentially 
+        self.metadata_list = [] 
 
         # --- Playback Timer (4 frames per second = 250ms interval) ---
         self.play_timer = QTimer(self)
@@ -164,11 +169,20 @@ class S3ImageSequenceViewer(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
         
-        # Left side: Compact Image List Sidebar
+        # Left side: Compact Image List Sidebar & RSP loader
+        left_layout = QVBoxLayout()
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.btn_load_rsp = QPushButton("Load GPS/Chainage RSP")
+        self.btn_load_rsp.clicked.connect(self.load_metadata_rsp)
+        left_layout.addWidget(self.btn_load_rsp)
+        
         self.image_list_widget = QListWidget()
-        self.image_list_widget.setMaximumWidth(180)  # Keep sidebar narrow
+        self.image_list_widget.setMaximumWidth(200)  
         self.image_list_widget.currentRowChanged.connect(self.load_image_by_index)
-        main_layout.addWidget(self.image_list_widget, 0)
+        left_layout.addWidget(self.image_list_widget)
+        
+        main_layout.addLayout(left_layout, 0)
         
         # Right side: Maximized Image display and enlarged controls
         right_layout = QVBoxLayout()
@@ -179,12 +193,18 @@ class S3ImageSequenceViewer(QMainWindow):
         self.status_label.setStyleSheet("font-size: 11pt; font-weight: bold; padding: 4px;")
         right_layout.addWidget(self.status_label)
         
+        # Metadata Header (Chainage / GPS)
+        self.metadata_label = QLabel("Chainage: N/A | GPS: N/A")
+        self.metadata_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.metadata_label.setStyleSheet("font-size: 11pt; color: #1565c0; font-weight: bold;")
+        right_layout.addWidget(self.metadata_label)
+        
         # Enlarged Image Viewport
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setMinimumSize(950, 650)
+        self.image_label.setMinimumSize(950, 600)
         self.image_label.setStyleSheet("background-color: black; color: white;")
-        right_layout.addWidget(self.image_label, 1)  # Stretch factor 1 fills viewport
+        right_layout.addWidget(self.image_label, 1) 
         
         # --- Large Rapid Rating Buttons (1 to 10) ---
         rating_container = QWidget()
@@ -198,10 +218,10 @@ class S3ImageSequenceViewer(QMainWindow):
         self.rating_buttons = []
         for score in range(1, 11):
             btn = QPushButton(str(score))
-            btn.setMinimumHeight(55)  # Large hit target
-            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # Prevents key focus interference
+            btn.setMinimumHeight(55) 
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus) 
             btn.clicked.connect(lambda checked, s=score: self.rate_current_image(s))
-            rating_group_layout.addWidget(btn, 1)  # Equal expanding width
+            rating_group_layout.addWidget(btn, 1) 
             self.rating_buttons.append(btn)
             
         self.btn_export = QPushButton("Export CSV")
@@ -242,30 +262,63 @@ class S3ImageSequenceViewer(QMainWindow):
         # Reset button styles to default state
         self._update_rating_buttons_ui(None)
         
+        # Setup Global Keyboard Shortcuts
+        self._setup_shortcuts()
+        
         # Fetch images on startup
         self.populate_image_list()
 
-    def keyPressEvent(self, event):
-        """Keyboard Shortcuts for rapid rating:
-        - Keys 1-9: Rate 1 through 9
-        - Key 0: Rate 10
-        - Spacebar: Play / Pause toggle
-        - Left / Right arrows: Navigate frames
-        """
-        key = event.key()
-        if Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
-            score = key - Qt.Key.Key_0
-            self.rate_current_image(score)
-        elif key == Qt.Key.Key_0:
-            self.rate_current_image(10)
-        elif key == Qt.Key.Key_Space:
-            self.toggle_playback()
-        elif key == Qt.Key.Key_Left:
-            self.prev_frame()
-        elif key == Qt.Key.Key_Right:
-            self.next_frame()
-        else:
-            super().keyPressEvent(event)
+    def _setup_shortcuts(self):
+        """Binds keys globally to the window using QShortcut."""
+        QShortcut(QKeySequence("Space"), self, self.toggle_playback)
+        QShortcut(QKeySequence("Left"), self, self.prev_frame)
+        QShortcut(QKeySequence("Right"), self, self.next_frame)
+        
+        # Keys 1-9
+        for i in range(1, 10):
+            QShortcut(QKeySequence(str(i)), self, lambda checked=False, score=i: self.rate_current_image(score))
+        # Key 0 = 10
+        QShortcut(QKeySequence("0"), self, lambda checked=False: self.rate_current_image(10))
+
+    def load_metadata_rsp(self):
+        """Parses the RSP file. Sequence '5280' holds the frame GPS data sequentially."""
+        start_dir = r"S:\RSP\RSP2026\TII Network Survey 2026\RSP TII Network Survey Data 2026"
+        if not os.path.exists(start_dir):
+            start_dir = "" # Fallback if drive S: isn't mapped
+
+        path, _ = QFileDialog.getOpenFileName(self, "Select RSP File", start_dir, "RSP Files (*.rsp *.RSP)")
+        if not path:
+            return
+            
+        try:
+            self.metadata_list.clear()
+            
+            # Read all text and split robustly to avoid Mac/Windows newline issues
+            with open(path, 'r', encoding='utf-8-sig', errors='ignore') as f:
+                content = f.read()
+                lines = re.split(r'\r\n|\r|\n', content)
+                for line in lines:
+                    if line.startswith("5280,"):
+                        parts = [p.strip() for p in line.split(',')]
+                        if len(parts) > 6:
+                            # Extract Chainage, Lat, and Lng
+                            chainage = parts[1]
+                            lat = parts[5]
+                            lng = parts[6]
+                            self.metadata_list.append({
+                                "Chainage": chainage,
+                                "Lat": lat,
+                                "Lng": lng
+                            })
+                            
+            QMessageBox.information(self, "Success", f"Loaded metadata for {len(self.metadata_list)} frames from RSP.")
+            
+            # Refresh current image metadata if one is loaded
+            if self.current_index >= 0:
+                self.load_image_by_index(self.current_index)
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Error Loading RSP", f"Could not parse the RSP file:\n{str(e)}")
 
     def populate_image_list(self):
         """Fetches all JPGs under the prefix."""
@@ -297,17 +350,33 @@ class S3ImageSequenceViewer(QMainWindow):
             QMessageBox.critical(self, "S3 Error", f"Could not load bucket data: {str(e)}")
 
     def load_image_by_index(self, index):
-        """Downloads and displays image, auto-applying active sticky rating if unrated."""
+        """Downloads and displays image, auto-applying sticky ratings and pulling sequential GPS data."""
         if index < 0 or index >= len(self.image_keys):
             return
-            S
+            
         self.current_index = index
         key = self.image_keys[self.current_index]
+        filename = key.split('/')[-1]
         
-        # If unrated yet a sticky rating exists, auto-apply it to this new frame
+        # 1. Apply Sticky Rating if image is unrated
         if key not in self.ratings and self.current_sticky_rating is not None:
             self.ratings[key] = self.current_sticky_rating
             
+        # 2. Extract Metadata by sequential index
+        metadata = {}
+        if self.current_index < len(self.metadata_list):
+            metadata = self.metadata_list[self.current_index]
+
+        # 3. Update the UI 
+        if metadata:
+            chainage = metadata.get("Chainage", "N/A")
+            lat = metadata.get("Lat", "N/A")
+            lng = metadata.get("Lng", "N/A")
+            self.metadata_label.setText(f"Chainage (km): {chainage} | GPS: {lat}, {lng}")
+        else:
+            self.metadata_label.setText("Chainage: N/A | GPS: N/A")
+
+        # 4. Load S3 Image
         try:
             response = self.s3.get_object(Bucket=self.bucket_name, Key=key)
             image_data = response['Body'].read()
@@ -322,7 +391,6 @@ class S3ImageSequenceViewer(QMainWindow):
             )
             self.image_label.setPixmap(scaled_pixmap)
             
-            filename = key.split('/')[-1]
             current_rating = self.ratings.get(key, "Unrated")
             self.status_label.setText(
                 f"Frame {self.current_index + 1} of {len(self.image_keys)} | {filename} | Current Rating: [{current_rating}]"
@@ -374,31 +442,21 @@ class S3ImageSequenceViewer(QMainWindow):
             if idx == active_score:
                 btn.setStyleSheet("""
                     QPushButton {
-                        font-size: 15pt;
-                        font-weight: bold;
-                        background-color: #1565c0;
-                        color: white;
-                        border: 3px solid #0d47a1;
-                        border-radius: 6px;
+                        font-size: 15pt; font-weight: bold; background-color: #1565c0; color: white;
+                        border: 3px solid #0d47a1; border-radius: 6px;
                     }
                 """)
             else:
                 btn.setStyleSheet("""
                     QPushButton {
-                        font-size: 13pt;
-                        font-weight: bold;
-                        background-color: #f0f0f0;
-                        color: #212121;
-                        border: 2px solid #bdbdbd;
-                        border-radius: 6px;
+                        font-size: 13pt; font-weight: bold; background-color: #f0f0f0; color: #212121;
+                        border: 2px solid #bdbdbd; border-radius: 6px;
                     }
-                    QPushButton:hover {
-                        background-color: #e0e0e0;
-                    }
+                    QPushButton:hover { background-color: #e0e0e0; }
                 """)
 
     def export_ratings(self):
-        """Exports ratings dictionary to a local CSV file."""
+        """Exports ratings and matched metadata to a local CSV file."""
         if not self.ratings:
             QMessageBox.information(self, "Export Ratings", "No images have been rated yet.")
             return
@@ -408,10 +466,27 @@ class S3ImageSequenceViewer(QMainWindow):
             try:
                 with open(path, 'w', newline='', encoding='utf-8') as f:
                     writer = csv.writer(f)
-                    writer.writerow(["Image_Key", "Filename", "Rating"])
+                    writer.writerow(["Image_Key", "Filename", "Rating", "Chainage", "Lat", "Lng"])
+                    
                     for key, score in sorted(self.ratings.items()):
                         filename = key.split('/')[-1]
-                        writer.writerow([key, filename, score])
+                        
+                        # Find the index of this key to get the correct metadata
+                        try:
+                            idx = self.image_keys.index(key)
+                            if idx < len(self.metadata_list):
+                                metadata = self.metadata_list[idx]
+                            else:
+                                metadata = {}
+                        except ValueError:
+                            metadata = {}
+                        
+                        chainage = metadata.get("Chainage", "")
+                        lat = metadata.get("Lat", "")
+                        lng = metadata.get("Lng", "")
+                        
+                        writer.writerow([key, filename, score, chainage, lat, lng])
+                        
                 QMessageBox.information(self, "Export Successful", f"Saved ratings for {len(self.ratings)} images to:\n{path}")
             except Exception as e:
                 QMessageBox.critical(self, "Export Error", f"Failed to save CSV file:\n{str(e)}")
