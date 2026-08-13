@@ -2,11 +2,13 @@ import sys
 import csv
 import os
 import re
+import datetime
 import boto3
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QListWidget, QLabel, QPushButton, QMessageBox, QDialog, 
-    QStackedWidget, QLineEdit, QFileDialog, QSizePolicy, QSlider
+    QStackedWidget, QLineEdit, QFileDialog, QSizePolicy, QSlider,
+    QComboBox, QFrame
 )
 from PyQt6.QtGui import QPixmap, QShortcut, QKeySequence
 from PyQt6.QtCore import Qt, QTimer
@@ -138,14 +140,15 @@ class CognitoLoginDialog(QDialog):
 
 
 class S3ImageSequenceViewer(QMainWindow):
-    def __init__(self, config: AppConfig, credentials: AssumedCredentials, prefix: str):
+    def __init__(self, config: AppConfig, credentials: AssumedCredentials, prefix: str, username: str):
         super().__init__()
         self.config = config
         self.credentials = credentials
         self.bucket_name = config.bucket_name
         self.prefix = prefix
+        self.username = username
         
-        self.setWindowTitle("S3 Survey Image Viewer & Rapid Rating Tool")
+        self.setWindowTitle("S3 Survey Image Viewer & QA Rating Tool")
 
         # Initialize S3 Client
         self.s3 = boto3.client(
@@ -157,8 +160,12 @@ class S3ImageSequenceViewer(QMainWindow):
         self.image_keys = []
         self.current_index = -1
         self.ratings = {}  
+        self.rating_dates = {}  # Tracks the exact datetime a rating was assigned
         self.current_sticky_rating = None  
-        self.metadata_list = [] 
+        
+        self.qa_segments = []  
+        self.full_metadata_list = [] 
+        self.metadata_list = []      
         self.current_pixmap = QPixmap() 
 
         # --- Rating Color Palette (Red to Green Gradient) ---
@@ -187,45 +194,60 @@ class S3ImageSequenceViewer(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
         
-        # Left side: Compact Image List Sidebar & RSP loader
+        # --- LEFT PANEL: QA Segment Workflow ---
         left_layout = QVBoxLayout()
         left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
         
-        self.btn_load_rsp = QPushButton("Load GPS/Chainage RSP")
-        self.btn_load_rsp.setStyleSheet("background-color: #212121; color: white; font-weight: bold; font-size: 10pt; padding: 6px;")
-        self.btn_load_rsp.clicked.connect(self.load_metadata_rsp)
-        left_layout.addWidget(self.btn_load_rsp)
+        qa_label = QLabel("<b>QA Segment Filtering</b>")
+        left_layout.addWidget(qa_label)
         
+        self.btn_load_qa = QPushButton("Load FileExtentsAWS.csv")
+        self.btn_load_qa.setStyleSheet("background-color: #1976d2; color: white; font-weight: bold; padding: 6px;")
+        self.btn_load_qa.clicked.connect(self.load_qa_csv)
+        left_layout.addWidget(self.btn_load_qa)
+        
+        self.qa_combo = QComboBox()
+        left_layout.addWidget(self.qa_combo)
+        
+        self.btn_load_segment = QPushButton("Load Selected Target")
+        self.btn_load_segment.setStyleSheet("background-color: #1565c0; color: white; font-weight: bold; padding: 6px;")
+        self.btn_load_segment.clicked.connect(self.load_selected_qa_segment)
+        left_layout.addWidget(self.btn_load_segment)
+        
+        # Visual Divider
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        left_layout.addWidget(line)
+        
+        # Image Browser List
         self.image_list_widget = QListWidget()
-        self.image_list_widget.setMaximumWidth(200)  
+        self.image_list_widget.setMaximumWidth(260)  
         self.image_list_widget.currentRowChanged.connect(self.load_image_by_index)
         left_layout.addWidget(self.image_list_widget)
         
         main_layout.addLayout(left_layout, 0)
         
-        # Right side: Maximized Image display and enlarged controls
+        # --- RIGHT PANEL: Image display and controls ---
         right_layout = QVBoxLayout()
         
-        # --- MASSIVE CURRENT RATING DISPLAY (Slightly Reduced Height) ---
         self.current_rating_label = QLabel("UNRATED")
         self.current_rating_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.current_rating_label.setMinimumHeight(45)
         self.current_rating_label.setStyleSheet("font-size: 20pt; font-weight: bold; background-color: #424242; color: white; border-radius: 6px;")
         right_layout.addWidget(self.current_rating_label)
 
-        # Status Bar Header
-        self.status_label = QLabel("Loading images from S3...")
+        self.status_label = QLabel(f"Logged in as: {self.username}")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.status_label.setStyleSheet("font-size: 10pt; font-weight: bold; padding: 2px;")
         right_layout.addWidget(self.status_label)
         
-        # Metadata Header (Chainage / GPS) - STARTS RED
         self.metadata_label = QLabel("Chainage: N/A | GPS: N/A")
         self.metadata_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.metadata_label.setStyleSheet("font-size: 10pt; color: #d32f2f; font-weight: bold;") 
         right_layout.addWidget(self.metadata_label)
         
-        # Enlarged Dynamic Image Viewport
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
@@ -233,7 +255,7 @@ class S3ImageSequenceViewer(QMainWindow):
         self.image_label.setStyleSheet("background-color: black; color: white;")
         right_layout.addWidget(self.image_label, 1) 
         
-        # --- Rapid Rating Buttons (1 to 10) ---
+        # Rapid Rating Buttons (1 to 10)
         rating_container = QWidget()
         rating_group_layout = QHBoxLayout(rating_container)
         rating_group_layout.setContentsMargins(0, 2, 0, 2)
@@ -260,7 +282,7 @@ class S3ImageSequenceViewer(QMainWindow):
         
         right_layout.addWidget(rating_container)
         
-        # --- FPS Slider Section ---
+        # FPS Slider Section
         fps_container = QWidget()
         fps_layout = QVBoxLayout(fps_container)
         fps_layout.setContentsMargins(0, 2, 0, 5) 
@@ -280,10 +302,9 @@ class S3ImageSequenceViewer(QMainWindow):
         
         fps_layout.addWidget(self.fps_label)
         fps_layout.addWidget(self.fps_slider)
-        
         right_layout.addWidget(fps_container)
         
-        # --- Navigation & Playback Controls (Bottom row) ---
+        # Navigation & Playback Controls
         controls_layout = QHBoxLayout()
         controls_layout.setContentsMargins(0, 0, 0, 5)
         
@@ -311,27 +332,18 @@ class S3ImageSequenceViewer(QMainWindow):
         
         main_layout.addLayout(right_layout, 1)
         
-        # Reset button styles to default state
         self._update_rating_buttons_ui(None)
-        
-        # Setup Global Keyboard Shortcuts
         self._setup_shortcuts()
-        
-        # Fetch images on startup
-        self.populate_image_list()
 
     def showEvent(self, event):
-        """Ensures the image is correctly scaled the moment the window appears on screen."""
         super().showEvent(event)
         self._update_image_display()
 
     def resizeEvent(self, event):
-        """Ensures the image dynamically scales to fit whenever the window is resized."""
         self._update_image_display()
         super().resizeEvent(event)
 
     def _update_image_display(self):
-        """Scales the raw pixmap to perfectly fit the current QLabel size without distortion."""
         if hasattr(self, 'current_pixmap') and not self.current_pixmap.isNull():
             scaled_pixmap = self.current_pixmap.scaled(
                 self.image_label.size(), 
@@ -341,101 +353,145 @@ class S3ImageSequenceViewer(QMainWindow):
             self.image_label.setPixmap(scaled_pixmap)
 
     def _setup_shortcuts(self):
-        """Binds keys globally to the window using QShortcut."""
         QShortcut(QKeySequence("Space"), self, self.toggle_playback)
         QShortcut(QKeySequence("Left"), self, self.prev_frame)
         QShortcut(QKeySequence("Right"), self, self.next_frame)
-        
-        # Keys 1-9
         for i in range(1, 10):
             QShortcut(QKeySequence(str(i)), self, lambda checked=False, score=i: self.rate_current_image(score))
-        # Key 0 = 10
         QShortcut(QKeySequence("0"), self, lambda checked=False: self.rate_current_image(10))
 
-    def load_metadata_rsp(self):
-        """Parses the RSP file for Date, Filename, Chainage, Lat, Lng, and Alt."""
-        start_dir = r"S:\RSP\RSP2026\TII Network Survey 2026\RSP TII Network Survey Data 2026"
-        if not os.path.exists(start_dir):
-            start_dir = "" 
-
-        path, _ = QFileDialog.getOpenFileName(self, "Select RSP File", start_dir, "RSP Files (*.rsp *.RSP)")
+    def load_qa_csv(self):
+        """Loads FileExtentsAWS.csv and populates the dropdown."""
+        path, _ = QFileDialog.getOpenFileName(self, "Select QA Segments CSV", "", "CSV Files (*.csv)")
         if not path:
             return
             
         try:
-            self.metadata_list.clear()
-            filename_val = os.path.splitext(os.path.basename(path))[0].upper()
-            date_val = "Unknown"
+            self.qa_segments.clear()
+            self.qa_combo.clear()
             
-            with open(path, 'r', encoding='utf-8-sig', errors='ignore') as f:
-                content = f.read()
-                lines = re.split(r'\r\n|\r|\n', content)
-                
-                for line in lines:
-                    parts = [p.strip().replace('"', '') for p in line.split(',')]
+            with open(path, 'r', encoding='utf-8-sig') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    self.qa_segments.append(row)
+                    fname = os.path.basename(row.get('RSPFile', 'Unknown RSP'))
+                    c_from = row.get('ChainageFrom', '0')
+                    c_to = row.get('ChainageTo', '0')
+                    self.qa_combo.addItem(f"{fname} ({c_from} to {c_to} km)")
                     
-                    if line.startswith("5011,") and len(parts) >= 6:
-                        date_val = f"{parts[3]}/{parts[4]}/{parts[5]}"
-                    elif line.startswith("5003,") and len(parts) >= 4:
-                        filename_val = parts[3]
-                    elif line.startswith("5280,") and len(parts) > 7:
-                        try:
-                            chainage_km = float(parts[1])
-                            chainage_m = round(chainage_km * 1000, 3)
-                        except ValueError:
-                            chainage_m = 0.0
-                            
-                        self.metadata_list.append({
-                            "Filename": filename_val,
-                            "Date": date_val,
-                            "Chainage": chainage_m,
-                            "Lat": parts[5],
-                            "Lng": parts[6],
-                            "Alt": parts[7]
-                        })
-                            
-            # Change label color from red to blue now that data is loaded
-            self.metadata_label.setStyleSheet("font-size: 10pt; color: #1565c0; font-weight: bold;")
-            
-            QMessageBox.information(self, "Success", f"Loaded metadata for {len(self.metadata_list)} frames from RSP.")
-            
-            if self.current_index >= 0:
-                self.load_image_by_index(self.current_index)
-                
+            QMessageBox.information(self, "Success", f"Loaded {len(self.qa_segments)} QA segments.")
         except Exception as e:
-            QMessageBox.critical(self, "Error Loading RSP", f"Could not parse the RSP file:\n{str(e)}")
+            QMessageBox.critical(self, "Error Loading QA CSV", f"Failed to read CSV:\n{e}")
 
-    def populate_image_list(self):
-        """Fetches all JPGs under the prefix."""
+    def load_selected_qa_segment(self):
+        """Changes S3 bucket focus, loads RSP, and filters frames between chainage limits."""
+        idx = self.qa_combo.currentIndex()
+        if idx < 0:
+            return
+            
+        segment = self.qa_segments[idx]
+        image0 = segment.get('Image0', '')
+        
+        if "://" in image0:
+            key_part = image0.split("://")[1] 
+            if key_part.startswith(self.bucket_name + "/"):
+                key_part = key_part[len(self.bucket_name) + 1:]
+        else:
+            key_part = image0
+            
+        self.prefix = os.path.dirname(key_part) + "/"
+        
+        try:
+            qa_chainage_from = float(segment.get('ChainageFrom', 0)) * 1000
+            qa_chainage_to = float(segment.get('ChainageTo', 0)) * 1000
+        except ValueError:
+            qa_chainage_from = 0.0
+            qa_chainage_to = 9999999.0
+            
+        rsp_path = segment.get('RSPFile', '')
+        if not os.path.exists(rsp_path):
+            QMessageBox.warning(self, "RSP Not Found", f"RSP file not found at:\n{rsp_path}\n\nPlease locate it manually.")
+            rsp_path, _ = QFileDialog.getOpenFileName(self, "Locate RSP File", "", "RSP Files (*.rsp *.RSP)")
+            if not rsp_path:
+                return 
+                
+        self._parse_rsp_file(rsp_path)
+        
+        self.status_label.setText("Fetching new images from S3...")
+        QApplication.processEvents()
+        
+        full_image_keys = []
         try:
             paginator = self.s3.get_paginator('list_objects_v2')
             pages = paginator.paginate(Bucket=self.bucket_name, Prefix=self.prefix)
-            
             for page in pages:
                 if 'Contents' in page:
                     for obj in page['Contents']:
                         key = obj['Key']
                         if key.lower().endswith(('.jpg', '.jpeg')):
-                            self.image_keys.append(key)
-            
-            self.image_keys.sort()
-            
-            if not self.image_keys:
-                self.status_label.setText("No images found in this folder.")
-                return
-                
-            for key in self.image_keys:
-                filename = key.split('/')[-1]
-                self.image_list_widget.addItem(filename)
-                
-            self.status_label.setText(f"Loaded {len(self.image_keys)} images | Press Space to Play/Stop | Keys 1-0 to Rate")
-            self.image_list_widget.setCurrentRow(0)
-            
+                            full_image_keys.append(key)
+            full_image_keys.sort()
         except Exception as e:
             QMessageBox.critical(self, "S3 Error", f"Could not load bucket data: {str(e)}")
+            return
+            
+        self.image_keys = []
+        self.metadata_list = []
+        
+        for idx_img, key in enumerate(full_image_keys):
+            meta = self.full_metadata_list[idx_img] if idx_img < len(self.full_metadata_list) else None
+            if meta is not None:
+                c = meta.get("Chainage", 0.0)
+                if qa_chainage_from <= c <= qa_chainage_to:
+                    self.image_keys.append(key)
+                    self.metadata_list.append(meta)
+                    
+        self.image_list_widget.clear()
+        for key in self.image_keys:
+            self.image_list_widget.addItem(key.split('/')[-1])
+            
+        self.metadata_label.setStyleSheet("font-size: 10pt; color: #1565c0; font-weight: bold;")
+        self.status_label.setText(f"Filtered {len(self.image_keys)} target frames | Press Space to Play/Stop | Keys 1-0 to Rate")
+        
+        if self.image_keys:
+            self.image_list_widget.setCurrentRow(0)
+        else:
+            QMessageBox.warning(self, "No Images Found", "No images found in the specified chainage range.")
+
+    def _parse_rsp_file(self, path):
+        """Universal parser for RSP files, storing data sequentially into full_metadata_list."""
+        self.full_metadata_list = []
+        filename_val = os.path.splitext(os.path.basename(path))[0].upper()
+        date_val = "Unknown"
+        
+        with open(path, 'r', encoding='utf-8-sig', errors='ignore') as f:
+            content = f.read()
+            lines = re.split(r'\r\n|\r|\n', content)
+            
+            for line in lines:
+                parts = [p.strip().replace('"', '') for p in line.split(',')]
+                
+                if line.startswith("5011,") and len(parts) >= 6:
+                    date_val = f"{parts[3]}/{parts[4]}/{parts[5]}"
+                elif line.startswith("5003,") and len(parts) >= 4:
+                    filename_val = parts[3]
+                elif line.startswith("5280,") and len(parts) > 7:
+                    try:
+                        chainage_km = float(parts[1])
+                        chainage_m = round(chainage_km * 1000, 3)
+                    except ValueError:
+                        chainage_m = 0.0
+                        
+                    self.full_metadata_list.append({
+                        "Filename": filename_val,
+                        "Date": date_val,
+                        "Chainage": chainage_m,
+                        "Lat": parts[5],
+                        "Lng": parts[6],
+                        "Alt": parts[7]
+                    })
 
     def load_image_by_index(self, index):
-        """Downloads and displays image, auto-applying sticky ratings and pulling sequential GPS data."""
         if index < 0 or index >= len(self.image_keys):
             return
             
@@ -443,16 +499,14 @@ class S3ImageSequenceViewer(QMainWindow):
         key = self.image_keys[self.current_index]
         filename = key.split('/')[-1]
         
-        # 1. Apply Sticky Rating if image is unrated
         if key not in self.ratings and self.current_sticky_rating is not None:
             self.ratings[key] = self.current_sticky_rating
+            self.rating_dates[key] = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
             
-        # 2. Extract Metadata by sequential index
         metadata = {}
         if self.current_index < len(self.metadata_list):
             metadata = self.metadata_list[self.current_index]
 
-        # 3. Update the UI 
         if metadata:
             chainage = metadata.get("Chainage", "N/A")
             lat = metadata.get("Lat", "N/A")
@@ -461,12 +515,10 @@ class S3ImageSequenceViewer(QMainWindow):
         else:
             self.metadata_label.setText("Chainage: N/A | GPS: N/A")
 
-        # 4. Load S3 Image
         try:
             response = self.s3.get_object(Bucket=self.bucket_name, Key=key)
             image_data = response['Body'].read()
             
-            # Load raw image into memory and scale via dedicated display update method
             self.current_pixmap.loadFromData(image_data)
             self._update_image_display()
             
@@ -479,7 +531,6 @@ class S3ImageSequenceViewer(QMainWindow):
             self.image_label.setText(f"Error loading image:\n{str(e)}")
 
     def _update_fps(self, value):
-        """Updates the timer interval live based on slider value."""
         self.current_fps = value
         self.fps_label.setText(f"<b>Playback Speed:</b> {self.current_fps} FPS")
         self.play_timer.setInterval(int(1000 / self.current_fps))
@@ -487,7 +538,6 @@ class S3ImageSequenceViewer(QMainWindow):
             self.btn_play.setText(f"▶ Play ({self.current_fps} FPS)")
 
     def toggle_playback(self):
-        """Starts or stops playback at the current FPS."""
         if self.is_playing:
             self.play_timer.stop()
             self.is_playing = False
@@ -500,26 +550,22 @@ class S3ImageSequenceViewer(QMainWindow):
             self.play_timer.start()
 
     def _auto_advance_frame(self):
-        """Timer callback to move to next frame, pausing at sequence end."""
         if self.current_index < len(self.image_keys) - 1:
             self.image_list_widget.setCurrentRow(self.current_index + 1)
         else:
             self.toggle_playback()
 
     def rate_current_image(self, score: int):
-        """Assigns a score (1-10) to the current frame and sets it as sticky going forward."""
         if self.current_index < 0 or self.current_index >= len(self.image_keys):
             return
             
         key = self.image_keys[self.current_index]
         self.current_sticky_rating = score 
         self.ratings[key] = score
+        self.rating_dates[key] = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
         self._update_rating_buttons_ui(score)
 
     def _update_rating_buttons_ui(self, active_score):
-        """Highlights the active rating button and updates the large color-matched display."""
-        
-        # 1. Update Large Display Banner
         if isinstance(active_score, int) and active_score in self.rating_colors:
             color = self.rating_colors[active_score]
             text_color = "white" if active_score <= 3 else "black"
@@ -529,24 +575,25 @@ class S3ImageSequenceViewer(QMainWindow):
             self.current_rating_label.setText("UNRATED")
             self.current_rating_label.setStyleSheet("font-size: 20pt; font-weight: bold; background-color: #424242; color: white; border-radius: 6px;")
 
-        # 2. Update the 1-10 Buttons
         for idx, btn in enumerate(self.rating_buttons, start=1):
             base_color = self.rating_colors[idx]
             btn_text_color = "white" if idx <= 3 else "black"
             
             if idx == active_score:
-                # Active button gets larger font and a thick white border
+                btn.setMinimumHeight(25)
+                btn.setMaximumHeight(25)
                 btn.setStyleSheet(f"""
                     QPushButton {{
-                        font-size: 18pt; font-weight: bold; background-color: {base_color}; color: {btn_text_color};
-                        border: 3px solid #ffffff; border-radius: 6px;
+                        font-size: 11pt; font-weight: bold; background-color: {base_color}; color: {btn_text_color};
+                        border: 3px solid #000000; border-radius: 6px;
                     }}
                 """)
             else:
-                # Inactive buttons return to normal sizing with subtle borders
+                btn.setMinimumHeight(50)
+                btn.setMaximumHeight(50)
                 btn.setStyleSheet(f"""
                     QPushButton {{
-                        font-size: 12pt; font-weight: bold; background-color: {base_color}; color: {btn_text_color};
+                        font-size: 14pt; font-weight: bold; background-color: {base_color}; color: {btn_text_color};
                         border: 1px solid #757575; border-radius: 6px;
                     }}
                     QPushButton:hover {{ border: 2px solid #ffffff; }}
@@ -564,6 +611,7 @@ class S3ImageSequenceViewer(QMainWindow):
                 with open(path, 'w', newline='', encoding='utf-8') as f:
                     writer = csv.writer(f)
                     
+                    # 1. Original headers without User/Date columns
                     writer.writerow([
                         "Filename", "Frame", "Chainage", "Lat", "Lng", "Alt", 
                         "IG_E", "IG_N", "IG_Height", "ITM_E", "ITM_N", "ITM_Height", 
@@ -605,11 +653,19 @@ class S3ImageSequenceViewer(QMainWindow):
                             last_written_chainage = chainage
                         last_written_rating = score
                             
+                        # 2. Write the standard data row
                         writer.writerow([
                             filename, frame_num, chainage, lat, lng, alt,
                             "", "", "", "", "", "",  
                             date_val, dist, score
                         ])
+                        
+                    # 3. Write the Username and Date string on the second to last line
+                    current_date = datetime.datetime.now().strftime("%d/%m/%Y")
+                    writer.writerow([f"{self.username} - {current_date}"])
+                    
+                    # 4. Write final END marker line
+                    writer.writerow(["END"])
                         
                 QMessageBox.information(self, "Export Successful", f"Saved condensed ratings to:\n{path}")
             except Exception as e:
@@ -637,9 +693,12 @@ if __name__ == '__main__':
     if login_dialog.exec() != QDialog.DialogCode.Accepted:
         sys.exit(0)
         
+    # Extract username after successful login
+    username = login_dialog.username_input.text().strip()
+        
     PREFIX = '2026/RSP TII Network Survey Imagery 2026/WE20260606/N04D226C/N04D226C_ROW/'
     
-    viewer = S3ImageSequenceViewer(config, login_dialog.credentials, PREFIX)
+    viewer = S3ImageSequenceViewer(config, login_dialog.credentials, PREFIX, username)
     viewer.resize(1450, 900)
     viewer.show()
     
