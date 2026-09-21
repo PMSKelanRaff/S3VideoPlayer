@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QMessageBox, QFileDialog, QSizePolicy,
     QSlider, QComboBox, QFrame, QCheckBox, QTabWidget, QLineEdit,
-    QToolBar, QApplication
+    QToolBar, QApplication, QSpinBox
 )
 from PyQt6.QtGui import QPixmap, QShortcut, QKeySequence
 from PyQt6.QtCore import Qt, QTimer
@@ -15,10 +15,11 @@ from config import AppConfig
 from auth import AssumedCredentials
 from survey_core import (
     parse_rsp_file, S3FrameSource, compute_section_boundaries,
-    SEVERITY_DEFECTS, SEVERITY_LEVELS, SINGLE_DEFECTS, defect_field_names,
+    PSCI_PERCENT_FIELDS, PSCI_RUTTING_DEPTH_FIELD, PSCI_CATEGORY_FIELDS,
+    PSCI_BOOLEAN_FIELDS, psci_field_names,
     RATING_COLORS,
 )
-from psci_scoring import compute_psci_score
+from psci_scoring import PSCIRatingInputs, compute_psci_rating, compute_psci_score
 
 # PSCI sections are surveyed in fixed 100m lengths (see compute_section_boundaries).
 SECTION_LENGTH_M = 100.0
@@ -74,7 +75,7 @@ def build_score_map_html(markers):
         color = RATING_COLORS.get(score, "#9e9e9e")
         marker_lines.append(
             "L.circleMarker([%s,%s],{radius:8,color:'#222',weight:1,fillColor:'%s',"
-            "fillOpacity:0.9}).bindPopup('PSCI score: %s (provisional)').addTo(map);"
+            "fillOpacity:0.9}).bindPopup('PSCI rating: %s').addTo(map);"
             % (lat, lng, color, score)
         )
 
@@ -282,6 +283,14 @@ class PSCIViewer(QMainWindow):
 
         return panel
 
+    # Label text for each PSCI rating field, per Table 1 of the Rural Flexible Roads Manual.
+    _PERCENT_FIELD_LABELS = {
+        "RavellingPct": "Ravelling (%):",
+        "BleedingPct": "Bleeding (%):",
+        "OtherCrackingPct": "Other Cracking (%):",
+        "StructuralDistressPct": "Structural Distress (%) (rutting/alligator/poor patching):",
+    }
+
     def _build_defect_grid(self):
         frame = QFrame()
         grid = QGridLayout(frame)
@@ -289,35 +298,49 @@ class PSCIViewer(QMainWindow):
         grid.setHorizontalSpacing(4)
         grid.setVerticalSpacing(1)
 
-        grid.addWidget(QLabel("<b>Low</b>"), 0, 1, alignment=Qt.AlignmentFlag.AlignCenter)
-        grid.addWidget(QLabel("<b>Medium</b>"), 0, 2, alignment=Qt.AlignmentFlag.AlignCenter)
-        grid.addWidget(QLabel("<b>High</b>"), 0, 3, alignment=Qt.AlignmentFlag.AlignCenter)
+        row = 0
+        self.percent_inputs = {}  # field name -> QSpinBox (0-100 %)
+        for field_name in PSCI_PERCENT_FIELDS:
+            grid.addWidget(QLabel(self._PERCENT_FIELD_LABELS[field_name]), row, 0)
+            spin = self._make_percent_spinbox()
+            grid.addWidget(spin, row, 1)
+            self.percent_inputs[field_name] = spin
+            row += 1
 
-        self.severity_combos = {}  # (defect, level) -> QComboBox
-        for row, defect in enumerate(SEVERITY_DEFECTS, start=1):
-            grid.addWidget(QLabel(f"{defect}:"), row, 0)
-            for col, level in enumerate(SEVERITY_LEVELS, start=1):
-                combo = self._make_count_combo()
-                grid.addWidget(combo, row, col)
-                self.severity_combos[(defect, level)] = combo
+        grid.addWidget(QLabel("Rutting Depth (mm):"), row, 0)
+        self.rutting_depth_input = QSpinBox()
+        self.rutting_depth_input.setRange(0, 200)
+        self.rutting_depth_input.setFixedWidth(56)
+        self.rutting_depth_input.setMaximumHeight(22)
+        grid.addWidget(self.rutting_depth_input, row, 1)
+        row += 1
 
-        self.single_combos = {}  # defect -> QComboBox
-        start_row = len(SEVERITY_DEFECTS) + 1
-        for offset, defect in enumerate(SINGLE_DEFECTS):
-            row = start_row + offset
-            grid.addWidget(QLabel(f"{defect}:"), row, 0)
-            combo = self._make_count_combo()
+        self.category_inputs = {}  # field name -> QComboBox
+        for field_name, options in PSCI_CATEGORY_FIELDS.items():
+            grid.addWidget(QLabel(f"{field_name}:"), row, 0)
+            combo = QComboBox()
+            combo.addItems(options)
+            combo.setMaximumHeight(22)
             grid.addWidget(combo, row, 1)
-            self.single_combos[defect] = combo
+            self.category_inputs[field_name] = combo
+            row += 1
+
+        self.boolean_inputs = {}  # field name -> QCheckBox
+        for field_name, label in PSCI_BOOLEAN_FIELDS.items():
+            checkbox = QCheckBox(label)
+            grid.addWidget(checkbox, row, 0, 1, 2)
+            self.boolean_inputs[field_name] = checkbox
+            row += 1
 
         return frame
 
-    def _make_count_combo(self):
-        combo = QComboBox()
-        combo.addItems([str(n) for n in range(10)])
-        combo.setFixedWidth(44)
-        combo.setMaximumHeight(22)
-        return combo
+    def _make_percent_spinbox(self):
+        spin = QSpinBox()
+        spin.setRange(0, 100)
+        spin.setSuffix("%")
+        spin.setFixedWidth(56)
+        spin.setMaximumHeight(22)
+        return spin
 
     def _build_map_tabs(self):
         # QWebEngineView reports a large default size hint (both dimensions) once it's
@@ -340,8 +363,8 @@ class PSCIViewer(QMainWindow):
             psci_map_index = self.map_tabs.addTab(self.psci_map_view, "PSCI Map")
             self.map_tabs.setTabToolTip(
                 psci_map_index,
-                "Score computed with a placeholder formula pending the official "
-                "TII PSCI scoring table — not verified for real reporting yet."
+                "Rating computed per Table 1 of the Rural Flexible Roads Manual (DTTAS, "
+                "Nov 2013) -- the published PSCI standard for non-national roads."
             )
         else:
             placeholder = QLabel(
@@ -620,21 +643,23 @@ class PSCIViewer(QMainWindow):
 
     def _populate_defect_inputs(self, saved_values):
         saved_values = saved_values or {}
-        for (defect, level), combo in self.severity_combos.items():
-            field = f"{defect.replace(' ', '')}_{level}"
-            combo.setCurrentIndex(saved_values.get(field, 0))
-        for defect, combo in self.single_combos.items():
-            field = defect.replace(' ', '')
-            combo.setCurrentIndex(saved_values.get(field, 0))
+        for field_name, spin in self.percent_inputs.items():
+            spin.setValue(int(saved_values.get(field_name, 0) or 0))
+        self.rutting_depth_input.setValue(int(saved_values.get(PSCI_RUTTING_DEPTH_FIELD, 0) or 0))
+        for field_name, combo in self.category_inputs.items():
+            combo.setCurrentText(saved_values.get(field_name, "None") or "None")
+        for field_name, checkbox in self.boolean_inputs.items():
+            checkbox.setChecked(bool(saved_values.get(field_name, False)))
 
     def _current_defect_values(self):
         values = {}
-        for (defect, level), combo in self.severity_combos.items():
-            field = f"{defect.replace(' ', '')}_{level}"
-            values[field] = combo.currentIndex()
-        for defect, combo in self.single_combos.items():
-            field = defect.replace(' ', '')
-            values[field] = combo.currentIndex()
+        for field_name, spin in self.percent_inputs.items():
+            values[field_name] = spin.value()
+        values[PSCI_RUTTING_DEPTH_FIELD] = self.rutting_depth_input.value()
+        for field_name, combo in self.category_inputs.items():
+            values[field_name] = combo.currentText()
+        for field_name, checkbox in self.boolean_inputs.items():
+            values[field_name] = checkbox.isChecked()
         return values
 
     def commit_current_rating(self):
@@ -680,14 +705,15 @@ class PSCIViewer(QMainWindow):
         if not path:
             return
 
-        defect_fields = defect_field_names()
+        rating_fields = psci_field_names()
 
         try:
             with open(path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 writer.writerow(
                     ["Filename", "Frame", "Chainage", "Lat", "Lng", "Alt", "Date",
-                     "DistanceFromLastReading(m)"] + defect_fields + ["PSCI_Score_Provisional"]
+                     "DistanceFromLastReading(m)"] + rating_fields
+                    + ["PSCI_Rating", "PSCI_Rating_Basis"]
                 )
 
                 last_written_values = None
@@ -723,10 +749,12 @@ class PSCIViewer(QMainWindow):
                         last_written_chainage = chainage
                     last_written_values = values
 
+                    result = compute_psci_rating(PSCIRatingInputs.from_dict(values))
+
                     writer.writerow(
                         [filename, frame_num, chainage, lat, lng, alt, date_val, dist]
-                        + [values.get(field, 0) for field in defect_fields]
-                        + [compute_psci_score(values)]
+                        + [values.get(field, 0) for field in rating_fields]
+                        + [result.rating, "; ".join(result.reasons)]
                     )
 
                 current_date = datetime.datetime.now().strftime("%d/%m/%Y")

@@ -17,23 +17,42 @@ RATING_COLORS = {
     10: "#00E676"   # Bright Green
 }
 
-# PSCI defects rated with a Low/Medium/High severity split, each a 0-9 count.
-SEVERITY_DEFECTS = ["Potholes", "Patching", "Alligator Cracking", "Rutting"]
-SEVERITY_LEVELS = ["Low", "Medium", "High"]
+# PSCI rating inputs, per Table 1 of the Rural Flexible Roads Manual (Dept. of Transport,
+# Tourism & Sport, Issue 1 Rev. 1, Nov 2013) -- the authoritative source for the Irish PSCI
+# scheme. These field names/options mirror psci_scoring.PSCIRatingInputs; keep both in sync.
 
-# PSCI defects rated with a single 0-9 count.
-SINGLE_DEFECTS = ["Raveling", "Depression", "Disintegration", "Bleeding", "Edge Breakup", "Other Cracking"]
+# Extent fields expressed as % of the rated section's surface/length affected.
+PSCI_PERCENT_FIELDS = ["RavellingPct", "BleedingPct", "OtherCrackingPct", "StructuralDistressPct"]
+
+# Rutting is the one distress Table 1 quantifies by depth rather than extent (>75mm = severe).
+PSCI_RUTTING_DEPTH_FIELD = "RuttingDepthMm"
+
+# Categorical fields: Table 1 describes these qualitatively (no numeric thresholds given), so
+# the rater selects a band directly rather than the app inferring one from a raw count.
+PSCI_SURFACE_DISTORTION_LEVELS = ["None", "Some", "Significant"]
+PSCI_PATCHING_CONDITIONS = ["None", "Good", "Fair", "Poor", "Very Poor", "Failed"]
+PSCI_POTHOLE_FREQUENCIES = ["None", "Isolated / Few", "Frequent", "More Frequent", "Many"]
+PSCI_EDGE_BREAKUP_EXTENTS = ["None", "Short lengths", "Continuous lengths"]
+
+PSCI_CATEGORY_FIELDS = {
+    "SurfaceDistortion": PSCI_SURFACE_DISTORTION_LEVELS,
+    "PatchingCondition": PSCI_PATCHING_CONDITIONS,
+    "PotholeFrequency": PSCI_POTHOLE_FREQUENCIES,
+    "EdgeBreakupExtent": PSCI_EDGE_BREAKUP_EXTENTS,
+}
+
+# Present/absent flags with no partial-extent concept in Table 1.
+PSCI_BOOLEAN_FIELDS = {
+    "DisintegrationPresent": "Road Disintegration Present",
+    "LocalisedStructuralDistress": "Very Localised Structural Distress (<5m² or a few isolated potholes)",
+}
 
 
-def defect_field_names():
-    """Column/field names for every PSCI defect dropdown, in a stable order."""
-    fields = []
-    for defect in SEVERITY_DEFECTS:
-        for level in SEVERITY_LEVELS:
-            fields.append(f"{defect.replace(' ', '')}_{level}")
-    for defect in SINGLE_DEFECTS:
-        fields.append(defect.replace(' ', ''))
-    return fields
+def psci_field_names():
+    """Column/field names for every PSCI rating input, in a stable order, matching
+    psci_scoring.PSCIRatingInputs.from_dict()/to_dict()."""
+    return (PSCI_PERCENT_FIELDS + [PSCI_RUTTING_DEPTH_FIELD]
+            + list(PSCI_CATEGORY_FIELDS.keys()) + list(PSCI_BOOLEAN_FIELDS.keys()))
 
 
 def parse_rsp_file(path):
