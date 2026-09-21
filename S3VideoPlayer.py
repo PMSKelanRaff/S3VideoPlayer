@@ -1,142 +1,20 @@
-import sys
 import csv
 import os
-import re
 import datetime
 import boto3
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-    QListWidget, QLabel, QPushButton, QMessageBox, QDialog, 
-    QStackedWidget, QLineEdit, QFileDialog, QSizePolicy, QSlider,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QListWidget, QLabel, QPushButton, QMessageBox,
+    QFileDialog, QSizePolicy, QSlider,
     QComboBox, QFrame
 )
 from PyQt6.QtGui import QPixmap, QShortcut, QKeySequence
 from PyQt6.QtCore import Qt, QTimer
 
 # Import authentication and configuration modules from local files
-from config import load_config, AppConfig
-from auth import (
-    AssumedCredentials, AuthError, MfaRequired,
-    initiate_login, respond_to_mfa_challenge, sign_in_and_get_bucket_credentials
-)
-
-
-class CognitoLoginDialog(QDialog):
-    """PyQt6 Login Dialog that handles Cognito User Pool authentication."""
-    def __init__(self, config: AppConfig, parent=None):
-        super().__init__(parent)
-        self.config = config
-        self.credentials: AssumedCredentials | None = None
-        self._pending_session: str | None = None
-        self._pending_username: str | None = None
-
-        self.setWindowTitle("S3 Viewer - Sign In")
-        self.setFixedSize(280, 140) 
-
-        self.stack = QStackedWidget(self)
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.setSpacing(5)
-        main_layout.addWidget(self.stack)
-
-        self._build_login_view()
-        self._build_mfa_view()
-
-    def _build_login_view(self):
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-
-        layout.addWidget(QLabel("Username:"))
-        self.username_input = QLineEdit()
-        layout.addWidget(self.username_input)
-
-        layout.addWidget(QLabel("Password:"))
-        self.password_input = QLineEdit()
-        self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.password_input.returnPressed.connect(self._handle_login)
-        layout.addWidget(self.password_input)
-
-        self.login_status = QLabel("")
-        self.login_status.setStyleSheet("color: red; font-size: 8pt;")
-        layout.addWidget(self.login_status)
-
-        self.btn_login = QPushButton("Sign In")
-        self.btn_login.clicked.connect(self._handle_login)
-        layout.addWidget(self.btn_login)
-
-        self.stack.addWidget(widget)
-
-    def _build_mfa_view(self):
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-
-        layout.addWidget(QLabel("Enter 6-digit Authenticator Code:"))
-        self.totp_input = QLineEdit()
-        self.totp_input.returnPressed.connect(self._handle_mfa)
-        layout.addWidget(self.totp_input)
-
-        self.mfa_status = QLabel("")
-        self.mfa_status.setStyleSheet("color: red; font-size: 8pt;")
-        layout.addWidget(self.mfa_status)
-
-        self.btn_mfa = QPushButton("Verify Code")
-        self.btn_mfa.clicked.connect(self._handle_mfa)
-        layout.addWidget(self.btn_mfa)
-
-        self.stack.addWidget(widget)
-
-    def _handle_login(self):
-        username = self.username_input.text().strip()
-        password = self.password_input.text()
-
-        if not username or not password:
-            self.login_status.setText("Username and password are required.")
-            return
-
-        self.login_status.setText("Authenticating...")
-        self.btn_login.setEnabled(False)
-
-        try:
-            id_token = initiate_login(self.config, username, password)
-            self._complete_authentication(id_token)
-        except MfaRequired as mfa:
-            self._pending_session = mfa.session
-            self._pending_username = mfa.username
-            self.stack.setCurrentIndex(1)
-            self.totp_input.setFocus()
-        except AuthError as err:
-            self.login_status.setText(str(err))
-            self.btn_login.setEnabled(True)
-
-    def _handle_mfa(self):
-        totp_code = self.totp_input.text().strip()
-        if not totp_code:
-            self.mfa_status.setText("Please enter your TOTP code.")
-            return
-
-        self.mfa_status.setText("Verifying MFA...")
-        self.btn_mfa.setEnabled(False)
-
-        try:
-            id_token = respond_to_mfa_challenge(
-                self.config, self._pending_username, self._pending_session, totp_code
-            )
-            self._complete_authentication(id_token)
-        except AuthError as err:
-            self.mfa_status.setText(str(err))
-            self.btn_mfa.setEnabled(True)
-
-    def _complete_authentication(self, id_token: str):
-        try:
-            self.credentials = sign_in_and_get_bucket_credentials(self.config, id_token)
-            self.accept()
-        except AuthError as err:
-            QMessageBox.critical(self, "Authentication Error", str(err))
-            self.reject()
+from config import AppConfig
+from auth import AssumedCredentials
+from survey_core import parse_rsp_file, S3FrameSource, RATING_COLORS
 
 
 class S3ImageSequenceViewer(QMainWindow):
@@ -156,7 +34,8 @@ class S3ImageSequenceViewer(QMainWindow):
             region_name=self.config.bucket_region,
             **self.credentials.as_boto_kwargs()
         )
-        
+        self.frame_source = S3FrameSource(self.s3, self.bucket_name)
+
         self.image_keys = []
         self.current_index = -1
         self.ratings = {}  
@@ -168,19 +47,8 @@ class S3ImageSequenceViewer(QMainWindow):
         self.metadata_list = []      
         self.current_pixmap = QPixmap() 
 
-        # --- Rating Color Palette (Red to Green Gradient) ---
-        self.rating_colors = {
-            1: "#D32F2F",   # Red
-            2: "#F4511E",   # Deep Orange
-            3: "#FB8C00",   # Orange
-            4: "#FFB300",   # Amber
-            5: "#FDD835",   # Dark Yellow
-            6: "#FFEE58",   # Yellow
-            7: "#D4E157",   # Lime
-            8: "#9CCC65",   # Yellow-Green
-            9: "#66BB6A",   # Light Green
-            10: "#00E676"   # Bright Green
-        }
+        # --- Rating Color Palette (Red to Green Gradient), shared with the PSCI Viewer ---
+        self.rating_colors = RATING_COLORS
 
         # --- Playback Timer ---
         self.current_fps = 10
@@ -380,6 +248,13 @@ class S3ImageSequenceViewer(QMainWindow):
                     self.qa_combo.addItem(f"{fname} ({c_from} to {c_to} km)")
                     
             QMessageBox.information(self, "Success", f"Loaded {len(self.qa_segments)} QA segments.")
+
+            # Load the first target immediately so there's no extra button press to see
+            # something on screen. Switching targets afterwards still requires an explicit
+            # "Load Selected Target" click, so an accidental combo-box change can't silently
+            # discard in-progress ratings.
+            if self.qa_combo.count() > 0:
+                self.load_selected_qa_segment()
         except Exception as e:
             QMessageBox.critical(self, "Error Loading QA CSV", f"Failed to read CSV:\n{e}")
 
@@ -415,37 +290,21 @@ class S3ImageSequenceViewer(QMainWindow):
             if not rsp_path:
                 return 
                 
-        self._parse_rsp_file(rsp_path)
-        
+        self.full_metadata_list = parse_rsp_file(rsp_path)
+
         self.status_label.setText("Fetching new images from S3...")
         QApplication.processEvents()
-        
-        full_image_keys = []
+
         try:
-            paginator = self.s3.get_paginator('list_objects_v2')
-            pages = paginator.paginate(Bucket=self.bucket_name, Prefix=self.prefix)
-            for page in pages:
-                if 'Contents' in page:
-                    for obj in page['Contents']:
-                        key = obj['Key']
-                        if key.lower().endswith(('.jpg', '.jpeg')):
-                            full_image_keys.append(key)
-            full_image_keys.sort()
+            full_image_keys = self.frame_source.list_frames(self.prefix)
         except Exception as e:
             QMessageBox.critical(self, "S3 Error", f"Could not load bucket data: {str(e)}")
             return
-            
-        self.image_keys = []
-        self.metadata_list = []
-        
-        for idx_img, key in enumerate(full_image_keys):
-            meta = self.full_metadata_list[idx_img] if idx_img < len(self.full_metadata_list) else None
-            if meta is not None:
-                c = meta.get("Chainage", 0.0)
-                if qa_chainage_from <= c <= qa_chainage_to:
-                    self.image_keys.append(key)
-                    self.metadata_list.append(meta)
-                    
+
+        self.image_keys, self.metadata_list = self.frame_source.filter_by_chainage(
+            full_image_keys, self.full_metadata_list, qa_chainage_from, qa_chainage_to
+        )
+
         self.image_list_widget.clear()
         for key in self.image_keys:
             self.image_list_widget.addItem(key.split('/')[-1])
@@ -457,39 +316,6 @@ class S3ImageSequenceViewer(QMainWindow):
             self.image_list_widget.setCurrentRow(0)
         else:
             QMessageBox.warning(self, "No Images Found", "No images found in the specified chainage range.")
-
-    def _parse_rsp_file(self, path):
-        """Universal parser for RSP files, storing data sequentially into full_metadata_list."""
-        self.full_metadata_list = []
-        filename_val = os.path.splitext(os.path.basename(path))[0].upper()
-        date_val = "Unknown"
-        
-        with open(path, 'r', encoding='utf-8-sig', errors='ignore') as f:
-            content = f.read()
-            lines = re.split(r'\r\n|\r|\n', content)
-            
-            for line in lines:
-                parts = [p.strip().replace('"', '') for p in line.split(',')]
-                
-                if line.startswith("5011,") and len(parts) >= 6:
-                    date_val = f"{parts[3]}/{parts[4]}/{parts[5]}"
-                elif line.startswith("5003,") and len(parts) >= 4:
-                    filename_val = parts[3]
-                elif line.startswith("5280,") and len(parts) > 7:
-                    try:
-                        chainage_km = float(parts[1])
-                        chainage_m = round(chainage_km * 1000, 3)
-                    except ValueError:
-                        chainage_m = 0.0
-                        
-                    self.full_metadata_list.append({
-                        "Filename": filename_val,
-                        "Date": date_val,
-                        "Chainage": chainage_m,
-                        "Lat": parts[5],
-                        "Lng": parts[6],
-                        "Alt": parts[7]
-                    })
 
     def load_image_by_index(self, index):
         if index < 0 or index >= len(self.image_keys):
@@ -516,9 +342,8 @@ class S3ImageSequenceViewer(QMainWindow):
             self.metadata_label.setText("Chainage: N/A | GPS: N/A")
 
         try:
-            response = self.s3.get_object(Bucket=self.bucket_name, Key=key)
-            image_data = response['Body'].read()
-            
+            image_data = self.frame_source.fetch_image_bytes(key)
+
             self.current_pixmap.loadFromData(image_data)
             self._update_image_display()
             
@@ -681,25 +506,9 @@ class S3ImageSequenceViewer(QMainWindow):
 
 
 if __name__ == '__main__':
-    app = QApplication(sys.argv)
-    
-    try:
-        config = load_config("config.json")
-    except Exception as err:
-        QMessageBox.critical(None, "Configuration Error", f"Failed to load config.json:\n{err}")
-        sys.exit(1)
-        
-    login_dialog = CognitoLoginDialog(config)
-    if login_dialog.exec() != QDialog.DialogCode.Accepted:
-        sys.exit(0)
-        
-    # Extract username after successful login
-    username = login_dialog.username_input.text().strip()
-        
-    PREFIX = '2026/RSP TII Network Survey Imagery 2026/WE20260606/N04D226C/N04D226C_ROW/'
-    
-    viewer = S3ImageSequenceViewer(config, login_dialog.credentials, PREFIX, username)
-    viewer.resize(1450, 900)
-    viewer.show()
-    
-    sys.exit(app.exec())
+    # Delegate to the shared entry point so running this file directly still
+    # shows the module selector (Image Viewer / PSCI Viewer) instead of
+    # jumping straight into this viewer. Imported here, not at module level,
+    # to avoid a circular import with main.py.
+    from main import main
+    main()

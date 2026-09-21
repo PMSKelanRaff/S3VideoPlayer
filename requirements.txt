@@ -1,0 +1,3 @@
+boto3>=1.34
+PyQt6>=6.6
+PyQt6-WebEngine>=6.6
