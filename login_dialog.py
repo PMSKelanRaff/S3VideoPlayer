@@ -1,16 +1,16 @@
-import sys
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, 
+    QDialog, QVBoxLayout, QLabel, QLineEdit,
     QPushButton, QMessageBox, QStackedWidget, QWidget
 )
-from PyQt6.QtCore import Qt
 
 from auth import (
     AppConfig, AssumedCredentials, AuthError, MfaRequired,
     initiate_login, respond_to_mfa_challenge, sign_in_and_get_bucket_credentials
 )
 
+
 class CognitoLoginDialog(QDialog):
+    """PyQt6 Login Dialog that handles Cognito User Pool authentication."""
     def __init__(self, config: AppConfig, parent=None):
         super().__init__(parent)
         self.config = config
@@ -18,12 +18,13 @@ class CognitoLoginDialog(QDialog):
         self._pending_session: str | None = None
         self._pending_username: str | None = None
 
-        self.setWindowTitle("S3 Viewer - Cognito Sign In")
-        self.setFixedSize(360, 220)
+        self.setWindowTitle("S3 Viewer - Sign In")
+        self.setFixedSize(280, 140)
 
-        # Use a QStackedWidget to seamlessly switch between Login and MFA views
         self.stack = QStackedWidget(self)
         main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(5)
         main_layout.addWidget(self.stack)
 
         self._build_login_view()
@@ -32,6 +33,8 @@ class CognitoLoginDialog(QDialog):
     def _build_login_view(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
 
         layout.addWidget(QLabel("Username:"))
         self.username_input = QLineEdit()
@@ -44,7 +47,7 @@ class CognitoLoginDialog(QDialog):
         layout.addWidget(self.password_input)
 
         self.login_status = QLabel("")
-        self.login_status.setStyleSheet("color: red;")
+        self.login_status.setStyleSheet("color: red; font-size: 8pt;")
         layout.addWidget(self.login_status)
 
         self.btn_login = QPushButton("Sign In")
@@ -56,14 +59,16 @@ class CognitoLoginDialog(QDialog):
     def _build_mfa_view(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
 
-        layout.addWidget(QLabel("Enter 6-digit Authenticator (TOTP) Code:"))
+        layout.addWidget(QLabel("Enter 6-digit Authenticator Code:"))
         self.totp_input = QLineEdit()
         self.totp_input.returnPressed.connect(self._handle_mfa)
         layout.addWidget(self.totp_input)
 
         self.mfa_status = QLabel("")
-        self.mfa_status.setStyleSheet("color: red;")
+        self.mfa_status.setStyleSheet("color: red; font-size: 8pt;")
         layout.addWidget(self.mfa_status)
 
         self.btn_mfa = QPushButton("Verify Code")
@@ -84,11 +89,9 @@ class CognitoLoginDialog(QDialog):
         self.btn_login.setEnabled(False)
 
         try:
-            # Step 1: Login via Cognito User Pool
             id_token = initiate_login(self.config, username, password)
             self._complete_authentication(id_token)
         except MfaRequired as mfa:
-            # Capture session and switch UI to TOTP screen
             self._pending_session = mfa.session
             self._pending_username = mfa.username
             self.stack.setCurrentIndex(1)
@@ -107,7 +110,6 @@ class CognitoLoginDialog(QDialog):
         self.btn_mfa.setEnabled(False)
 
         try:
-            # Step 2: Answer SOFTWARE_TOKEN_MFA challenge
             id_token = respond_to_mfa_challenge(
                 self.config, self._pending_username, self._pending_session, totp_code
             )
@@ -118,9 +120,8 @@ class CognitoLoginDialog(QDialog):
 
     def _complete_authentication(self, id_token: str):
         try:
-            # Step 3 & 4: Exchange ID Token -> Identity Pool -> Cross-Account AssumeRole
             self.credentials = sign_in_and_get_bucket_credentials(self.config, id_token)
-            self.accept() # Close dialog with QDialog.Accepted result
+            self.accept()
         except AuthError as err:
             QMessageBox.critical(self, "Authentication Error", str(err))
             self.reject()
