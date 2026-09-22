@@ -1,3 +1,20 @@
+"""
+PCI Viewer.
+
+Lets an inspector step through S3 survey frames and record distress observations
+(distress type, severity, quantity bucket) using the methodology-agnostic vocabulary
+in distress_catalog.py. Named for this project's target methodology (ASTM D6433 PCI),
+but this module does NOT calculate or display a PCI value -- see
+D6433_ARCHITECTURE.md. The ASTM D6433 calculation pipeline
+(inspection_observation.py -> d6433_adapter.py -> d6433_engine.py) exists but remains
+blocked on authoritative D6433 reference data, so no rating is computed or displayed
+here; this viewer only records and exports what the inspector observed.
+
+PSCI (the Irish Rural Flexible Roads Manual scheme this application previously
+implemented) has been removed as a project decision -- this application targets
+ASTM D6433 PCI once the reference data is available, not PSCI. See
+D6433_ARCHITECTURE.md's "PSCI removal" section for what depended on it and why.
+"""
 import csv
 import os
 import datetime
@@ -6,22 +23,19 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QMessageBox, QFileDialog, QSizePolicy,
     QSlider, QComboBox, QFrame, QCheckBox, QTabWidget, QLineEdit,
-    QToolBar, QApplication, QSpinBox
+    QToolBar, QApplication
 )
 from PyQt6.QtGui import QPixmap, QShortcut, QKeySequence
 from PyQt6.QtCore import Qt, QTimer
 
 from config import AppConfig
 from auth import AssumedCredentials
-from survey_core import (
-    parse_rsp_file, S3FrameSource, compute_section_boundaries,
-    PSCI_PERCENT_FIELDS, PSCI_RUTTING_DEPTH_FIELD, PSCI_CATEGORY_FIELDS,
-    PSCI_BOOLEAN_FIELDS, psci_field_names,
-    RATING_COLORS,
+from survey_core import parse_rsp_file, S3FrameSource, compute_section_boundaries
+from distress_catalog import (
+    DISTRESS_DEFINITIONS, NO_SEVERITY, detailed_field_names, get_distress,
 )
-from psci_scoring import PSCIRatingInputs, compute_psci_rating, compute_psci_score
 
-# PSCI sections are surveyed in fixed 100m lengths (see compute_section_boundaries).
+# Sample units are surveyed in fixed 100m lengths (see compute_section_boundaries).
 SECTION_LENGTH_M = 100.0
 
 try:
@@ -44,49 +58,8 @@ L.tileLayer('https://__SUBDOMAIN__.tile.openstreetmap.org/{z}/{x}/{y}.png', {
 L.marker([__LAT__, __LNG__]).addTo(map);
 </script></body></html>"""
 
-_SCORE_MAP_HTML_TEMPLATE = """<!DOCTYPE html><html><head>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<style>html,body,#map{margin:0;padding:0;height:100%;}</style>
-</head><body><div id="map"></div>
-<script>
-var map = L.map('map').setView([__LAT__, __LNG__], __ZOOM__);
-L.tileLayer('https://a.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  attribution: '&copy; OpenStreetMap contributors'
-}).addTo(map);
-__MARKERS__
-</script></body></html>"""
 
-
-def build_score_map_html(markers):
-    """markers: list of (lat, lng, score) tuples, one per rated PSCI section.
-    Returns a Leaflet/OSM HTML page with one colour-coded marker per section
-    (colour from survey_core.RATING_COLORS, same palette the Image Viewer uses).
-    Pure/no Qt dependency so it can be unit tested directly."""
-    if not markers:
-        center_lat, center_lng, zoom = 53.4, -6.8, 6
-    else:
-        center_lat = sum(m[0] for m in markers) / len(markers)
-        center_lng = sum(m[1] for m in markers) / len(markers)
-        zoom = 15
-
-    marker_lines = []
-    for lat, lng, score in markers:
-        color = RATING_COLORS.get(score, "#9e9e9e")
-        marker_lines.append(
-            "L.circleMarker([%s,%s],{radius:8,color:'#222',weight:1,fillColor:'%s',"
-            "fillOpacity:0.9}).bindPopup('PSCI rating: %s').addTo(map);"
-            % (lat, lng, color, score)
-        )
-
-    return (_SCORE_MAP_HTML_TEMPLATE
-            .replace("__LAT__", str(center_lat))
-            .replace("__LNG__", str(center_lng))
-            .replace("__ZOOM__", str(zoom))
-            .replace("__MARKERS__", "\n".join(marker_lines)))
-
-
-class PSCIViewer(QMainWindow):
+class PCIViewer(QMainWindow):
     def __init__(self, config: AppConfig, credentials: AssumedCredentials, prefix: str, username: str):
         super().__init__()
         self.config = config
@@ -95,7 +68,7 @@ class PSCIViewer(QMainWindow):
         self.prefix = prefix
         self.username = username
 
-        self.setWindowTitle("PSCI Viewer - Pavement Surface Condition Survey")
+        self.setWindowTitle("PCI Viewer")
 
         self.s3 = boto3.client(
             's3',
@@ -106,15 +79,15 @@ class PSCIViewer(QMainWindow):
 
         self.image_keys = []
         self.current_index = -1
-        self.ratings = {}          # image key -> dict of defect field -> 0-9
-        self.rating_dates = {}
+        self.observations = {}         # image key -> dict of distress storage key -> selected bucket label
+        self.observation_dates = {}
         self.qa_segments = []
         self.full_metadata_list = []
         self.metadata_list = []
         self.current_pixmap = QPixmap()
         self.current_project_name = ""
 
-        # Fixed-length (100m) section boundaries for the currently loaded target,
+        # Fixed-length (100m) sample-unit boundaries for the currently loaded target,
         # in absolute chainage metres. Continuous playback auto-pauses at each one.
         self.section_boundaries = []
         self.next_boundary_index = 0
@@ -141,7 +114,7 @@ class PSCIViewer(QMainWindow):
         body_layout.addWidget(self._build_right_panel(), 0)
         outer_layout.addLayout(body_layout, 1)
 
-        self._reset_defect_inputs()
+        self._reset_distress_inputs()
         self._setup_shortcuts()
 
     # ------------------------------------------------------------------
@@ -245,14 +218,14 @@ class PSCIViewer(QMainWindow):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(3)
 
-        layout.addWidget(self._build_defect_grid())
+        layout.addWidget(self._build_distress_observation_grid())
 
         self.chk_play_after_enter = QCheckBox("Play after Enter")
         layout.addWidget(self.chk_play_after_enter)
 
         self.btn_enter = QPushButton("Enter")
         self.btn_enter.setMinimumHeight(28)
-        self.btn_enter.clicked.connect(self.commit_current_rating)
+        self.btn_enter.clicked.connect(self.commit_current_observation)
         layout.addWidget(self.btn_enter)
 
         controls_layout = QHBoxLayout()
@@ -276,71 +249,60 @@ class PSCIViewer(QMainWindow):
 
         self.btn_export = QPushButton("Export CSV")
         self.btn_export.setMinimumHeight(26)
-        self.btn_export.clicked.connect(self.export_ratings)
+        self.btn_export.clicked.connect(self.export_observations)
         layout.addWidget(self.btn_export)
 
         layout.addWidget(self._build_map_tabs(), 1)
 
         return panel
 
-    # Label text for each PSCI rating field, per Table 1 of the Rural Flexible Roads Manual.
-    _PERCENT_FIELD_LABELS = {
-        "RavellingPct": "Ravelling (%):",
-        "BleedingPct": "Bleeding (%):",
-        "OtherCrackingPct": "Other Cracking (%):",
-        "StructuralDistressPct": "Structural Distress (%) (rutting/alligator/poor patching):",
-    }
-
-    def _build_defect_grid(self):
+    def _build_distress_observation_grid(self):
+        """Config-driven distress entry grid (vocabulary from distress_catalog.py):
+        one dropdown per (distress, severity) cell, matching the Low/Medium/High
+        severity-bucket layout the grid was originally built from. Purely records
+        what the inspector selects -- no rating or score is calculated here. Once
+        the D6433 reference data is available, these selections are the raw material
+        an InspectionObservation is built from (see D6433_ARCHITECTURE.md); today
+        they are only stored locally and exported, nothing more."""
         frame = QFrame()
         grid = QGridLayout(frame)
         grid.setContentsMargins(2, 2, 2, 2)
-        grid.setHorizontalSpacing(4)
+        grid.setHorizontalSpacing(6)
         grid.setVerticalSpacing(1)
 
-        row = 0
-        self.percent_inputs = {}  # field name -> QSpinBox (0-100 %)
-        for field_name in PSCI_PERCENT_FIELDS:
-            grid.addWidget(QLabel(self._PERCENT_FIELD_LABELS[field_name]), row, 0)
-            spin = self._make_percent_spinbox()
-            grid.addWidget(spin, row, 1)
-            self.percent_inputs[field_name] = spin
+        columns = ["Low", "Medium", "High"]
+        for col, heading in enumerate(columns, start=1):
+            label = QLabel(f"<b>{heading}</b>")
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            grid.addWidget(label, 0, col)
+
+        self.distress_inputs = {}  # (distress_id, severity) -> QComboBox
+        row = 1
+        severity_distresses = [d for d in DISTRESS_DEFINITIONS if d.severities]
+        single_distresses = [d for d in DISTRESS_DEFINITIONS if not d.severities]
+
+        for d in severity_distresses:
+            grid.addWidget(QLabel(f"{d.label}:"), row, 0)
+            for col, heading in enumerate(columns, start=1):
+                if heading not in d.severities:
+                    continue  # e.g. Rutting has no Low severity in the catalog
+                combo = QComboBox()
+                combo.addItems(d.options[heading])
+                combo.setMaximumHeight(22)
+                grid.addWidget(combo, row, col)
+                self.distress_inputs[(d.distress_id, heading)] = combo
             row += 1
 
-        grid.addWidget(QLabel("Rutting Depth (mm):"), row, 0)
-        self.rutting_depth_input = QSpinBox()
-        self.rutting_depth_input.setRange(0, 200)
-        self.rutting_depth_input.setFixedWidth(56)
-        self.rutting_depth_input.setMaximumHeight(22)
-        grid.addWidget(self.rutting_depth_input, row, 1)
-        row += 1
-
-        self.category_inputs = {}  # field name -> QComboBox
-        for field_name, options in PSCI_CATEGORY_FIELDS.items():
-            grid.addWidget(QLabel(f"{field_name}:"), row, 0)
+        for d in single_distresses:
+            grid.addWidget(QLabel(f"{d.label}:"), row, 0)
             combo = QComboBox()
-            combo.addItems(options)
+            combo.addItems(d.options[NO_SEVERITY])
             combo.setMaximumHeight(22)
             grid.addWidget(combo, row, 1)
-            self.category_inputs[field_name] = combo
-            row += 1
-
-        self.boolean_inputs = {}  # field name -> QCheckBox
-        for field_name, label in PSCI_BOOLEAN_FIELDS.items():
-            checkbox = QCheckBox(label)
-            grid.addWidget(checkbox, row, 0, 1, 2)
-            self.boolean_inputs[field_name] = checkbox
+            self.distress_inputs[(d.distress_id, NO_SEVERITY)] = combo
             row += 1
 
         return frame
-
-    def _make_percent_spinbox(self):
-        spin = QSpinBox()
-        spin.setRange(0, 100)
-        spin.setSuffix("%")
-        spin.setFixedWidth(56)
-        spin.setMaximumHeight(22)
-        return spin
 
     def _build_map_tabs(self):
         # QWebEngineView reports a large default size hint (both dimensions) once it's
@@ -357,15 +319,6 @@ class PSCIViewer(QMainWindow):
             self.map_view = QWebEngineView()
             self.map_view.setFixedSize(MAP_WIDTH, MAP_HEIGHT)
             self.map_tabs.addTab(self.map_view, "GPS")
-
-            self.psci_map_view = QWebEngineView()
-            self.psci_map_view.setFixedSize(MAP_WIDTH, MAP_HEIGHT)
-            psci_map_index = self.map_tabs.addTab(self.psci_map_view, "PSCI Map")
-            self.map_tabs.setTabToolTip(
-                psci_map_index,
-                "Rating computed per Table 1 of the Rural Flexible Roads Manual (DTTAS, "
-                "Nov 2013) -- the published PSCI standard for non-national roads."
-            )
         else:
             placeholder = QLabel(
                 "GPS map unavailable.\nInstall PyQt6-WebEngine to enable the live map."
@@ -374,41 +327,17 @@ class PSCIViewer(QMainWindow):
             self.map_view = None
             self.map_tabs.addTab(placeholder, "GPS")
 
-            score_placeholder = QLabel(
-                "PSCI map unavailable.\nInstall PyQt6-WebEngine to enable it."
-            )
-            score_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.psci_map_view = None
-            self.map_tabs.addTab(score_placeholder, "PSCI Map")
-
         iri_placeholder = QLabel("No IRI data source configured.")
         iri_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.map_tabs.addTab(iri_placeholder, "IRI")
 
         return self.map_tabs
 
-    def _refresh_psci_score_map(self):
-        if self.psci_map_view is None:
-            return
-
-        markers = []
-        for key, values in self.ratings.items():
-            try:
-                idx = self.image_keys.index(key)
-                meta = self.metadata_list[idx]
-                lat = float(meta.get("Lat"))
-                lng = float(meta.get("Lng"))
-            except (ValueError, IndexError, TypeError):
-                continue
-            markers.append((lat, lng, compute_psci_score(values)))
-
-        self.psci_map_view.setHtml(build_score_map_html(markers))
-
     def _setup_shortcuts(self):
         QShortcut(QKeySequence("Space"), self, self.toggle_playback)
         QShortcut(QKeySequence("Right"), self, self.skip_frame)
         QShortcut(QKeySequence("Left"), self, self.prev_frame)
-        QShortcut(QKeySequence("Return"), self, self.commit_current_rating)
+        QShortcut(QKeySequence("Return"), self, self.commit_current_observation)
 
     # ------------------------------------------------------------------
     # Segment / frame loading (mirrors the Image Viewer's QA workflow)
@@ -436,7 +365,7 @@ class PSCIViewer(QMainWindow):
             # Load the first target immediately so there's no extra button press to see
             # something on screen. Switching targets afterwards still requires an explicit
             # "Load Selected Target" click, so an accidental combo-box change can't silently
-            # discard in-progress ratings.
+            # discard in-progress observations.
             if self.qa_combo.count() > 0:
                 self.load_selected_qa_segment()
         except Exception as e:
@@ -499,12 +428,11 @@ class PSCIViewer(QMainWindow):
         length_km = float(segment.get('ChainageTo', 0)) - float(segment.get('ChainageFrom', 0))
         self.field_length.setText(f"{length_km:.3f} km")
 
-        self.status_label.setText(f"Loaded {len(self.image_keys)} frames | Space = Play/Pause | Enter = Save rating")
+        self.status_label.setText(f"Loaded {len(self.image_keys)} frames | Space = Play/Pause | Enter = Save observation")
 
         if self.image_keys:
             self.current_index = -1
             self._load_frame(0)
-            self._refresh_psci_score_map()
         else:
             QMessageBox.warning(self, "No Images Found", "No images found in the specified chainage range.")
 
@@ -532,8 +460,8 @@ class PSCIViewer(QMainWindow):
         except Exception as e:
             self.image_label.setText(f"Error loading image:\n{str(e)}")
 
-        saved = self.ratings.get(key)
-        self._populate_defect_inputs(saved)
+        saved = self.observations.get(key)
+        self._populate_distress_inputs(saved)
 
         self._update_map(metadata.get("Lat"), metadata.get("Lng"))
 
@@ -541,14 +469,15 @@ class PSCIViewer(QMainWindow):
         if crossed and self.is_playing:
             self.pause_playback()
             self.status_label.setText(
-                f"Section boundary reached at {metadata.get('Chainage')}m — rate this section, then Play to continue."
+                f"Sample unit boundary reached at {metadata.get('Chainage')}m — "
+                f"record this section's observations, then Play to continue."
             )
         else:
             self.status_label.setText(f"Frame {index + 1} of {len(self.image_keys)} | {filename}")
 
     def _sync_section_pointer(self, chainage):
-        """Advances past any 100m section boundaries this frame's chainage has now
-        reached. Returns True if at least one boundary was newly crossed."""
+        """Advances past any 100m sample-unit boundaries this frame's chainage has
+        now reached. Returns True if at least one boundary was newly crossed."""
         if chainage is None:
             return False
 
@@ -585,11 +514,11 @@ class PSCIViewer(QMainWindow):
             self._load_frame(self.current_index - 1)
 
     def skip_frame(self):
-        """Advance without recording a rating for the current frame."""
+        """Advance without recording an observation for the current frame."""
         self.next_frame()
 
     def rerun_segment(self):
-        """Replay the current segment from its first frame. Already-saved ratings are kept."""
+        """Replay the current segment from its first frame. Already-saved observations are kept."""
         self.pause_playback()
         self.next_boundary_index = 0
         if self.image_keys:
@@ -636,40 +565,40 @@ class PSCIViewer(QMainWindow):
             self.pause_playback()
 
     # ------------------------------------------------------------------
-    # Defect rating entry
+    # Distress observation entry
     # ------------------------------------------------------------------
-    def _reset_defect_inputs(self):
-        self._populate_defect_inputs(None)
+    def _reset_distress_inputs(self):
+        self._populate_distress_inputs(None)
 
-    def _populate_defect_inputs(self, saved_values):
+    def _populate_distress_inputs(self, saved_values):
         saved_values = saved_values or {}
-        for field_name, spin in self.percent_inputs.items():
-            spin.setValue(int(saved_values.get(field_name, 0) or 0))
-        self.rutting_depth_input.setValue(int(saved_values.get(PSCI_RUTTING_DEPTH_FIELD, 0) or 0))
-        for field_name, combo in self.category_inputs.items():
-            combo.setCurrentText(saved_values.get(field_name, "None") or "None")
-        for field_name, checkbox in self.boolean_inputs.items():
-            checkbox.setChecked(bool(saved_values.get(field_name, False)))
+        for (distress_id, severity), combo in self.distress_inputs.items():
+            storage_key = self._distress_storage_key(distress_id, severity)
+            saved_label = saved_values.get(storage_key)
+            index = combo.findText(saved_label) if saved_label else -1
+            combo.setCurrentIndex(index if index >= 0 else 0)
 
-    def _current_defect_values(self):
+    def _distress_storage_key(self, distress_id, severity):
+        return get_distress(distress_id).storage_key(severity)
+
+    def _current_distress_selections(self):
+        """The inspector's raw selections for the current frame -- distress storage
+        key -> selected bucket label. No calculation happens here; see
+        D6433_ARCHITECTURE.md for how this would eventually feed an
+        InspectionObservation once the D6433 reference data is available."""
         values = {}
-        for field_name, spin in self.percent_inputs.items():
-            values[field_name] = spin.value()
-        values[PSCI_RUTTING_DEPTH_FIELD] = self.rutting_depth_input.value()
-        for field_name, combo in self.category_inputs.items():
-            values[field_name] = combo.currentText()
-        for field_name, checkbox in self.boolean_inputs.items():
-            values[field_name] = checkbox.isChecked()
+        for (distress_id, severity), combo in self.distress_inputs.items():
+            storage_key = self._distress_storage_key(distress_id, severity)
+            values[storage_key] = combo.currentText()
         return values
 
-    def commit_current_rating(self):
+    def commit_current_observation(self):
         if self.current_index < 0 or self.current_index >= len(self.image_keys):
             return
 
         key = self.image_keys[self.current_index]
-        self.ratings[key] = self._current_defect_values()
-        self.rating_dates[key] = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-        self._refresh_psci_score_map()
+        self.observations[key] = self._current_distress_selections()
+        self.observation_dates[key] = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
         if self.chk_play_after_enter.isChecked():
             self.next_frame()
@@ -696,32 +625,33 @@ class PSCIViewer(QMainWindow):
     # ------------------------------------------------------------------
     # Export
     # ------------------------------------------------------------------
-    def export_ratings(self):
-        if not self.ratings:
-            QMessageBox.information(self, "Export Ratings", "No frames have been rated yet.")
+    def export_observations(self):
+        if not self.observations:
+            QMessageBox.information(self, "Export Observations", "No frames have been recorded yet.")
             return
 
-        path, _ = QFileDialog.getSaveFileName(self, "Save PSCI Ratings CSV", "psci_ratings.csv", "CSV Files (*.csv)")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Pavement Inspection CSV", "pavement_inspection.csv", "CSV Files (*.csv)"
+        )
         if not path:
             return
 
-        rating_fields = psci_field_names()
+        detail_fields = detailed_field_names()
 
         try:
             with open(path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 writer.writerow(
                     ["Filename", "Frame", "Chainage", "Lat", "Lng", "Alt", "Date",
-                     "DistanceFromLastReading(m)"] + rating_fields
-                    + ["PSCI_Rating", "PSCI_Rating_Basis"]
+                     "DistanceFromLastReading(m)"] + detail_fields
                 )
 
                 last_written_values = None
                 last_written_chainage = None
-                sorted_keys = sorted(self.ratings.keys())
+                sorted_keys = sorted(self.observations.keys())
 
                 for key in sorted_keys:
-                    values = self.ratings[key]
+                    values = self.observations[key]
                     if values == last_written_values:
                         continue
 
@@ -749,18 +679,15 @@ class PSCIViewer(QMainWindow):
                         last_written_chainage = chainage
                     last_written_values = values
 
-                    result = compute_psci_rating(PSCIRatingInputs.from_dict(values))
-
                     writer.writerow(
                         [filename, frame_num, chainage, lat, lng, alt, date_val, dist]
-                        + [values.get(field, 0) for field in rating_fields]
-                        + [result.rating, "; ".join(result.reasons)]
+                        + [values.get(field, "") for field in detail_fields]
                     )
 
                 current_date = datetime.datetime.now().strftime("%d/%m/%Y")
                 writer.writerow([f"{self.username} - {current_date}"])
                 writer.writerow(["END"])
 
-            QMessageBox.information(self, "Export Successful", f"Saved PSCI ratings to:\n{path}")
+            QMessageBox.information(self, "Export Successful", f"Saved pavement inspection data to:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"Failed to save CSV file:\n{str(e)}")

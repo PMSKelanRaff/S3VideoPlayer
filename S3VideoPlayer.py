@@ -47,7 +47,7 @@ class S3ImageSequenceViewer(QMainWindow):
         self.metadata_list = []      
         self.current_pixmap = QPixmap() 
 
-        # --- Rating Color Palette (Red to Green Gradient), shared with the PSCI Viewer ---
+        # --- Rating Color Palette (Red to Green Gradient), shared with the PCI Viewer ---
         self.rating_colors = RATING_COLORS
 
         # --- Playback Timer ---
@@ -507,7 +507,7 @@ class S3ImageSequenceViewer(QMainWindow):
 
 if __name__ == '__main__':
     # Delegate to the shared entry point so running this file directly still
-    # shows the module selector (Image Viewer / PSCI Viewer) instead of
+    # shows the module selector (Image Viewer / PCI Viewer) instead of
     # jumping straight into this viewer. Imported here, not at module level,
     # to avoid a circular import with main.py.
     from main import main

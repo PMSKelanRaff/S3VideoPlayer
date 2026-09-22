@@ -5,7 +5,7 @@ from config import load_config
 from login_dialog import CognitoLoginDialog
 from module_selector_dialog import ModuleSelectorDialog
 from S3VideoPlayer import S3ImageSequenceViewer
-from psci_viewer import PSCIViewer
+from pci_viewer import PCIViewer
 
 # Default S3 prefix new sessions start from; both modules let the user pick
 # a different segment afterwards via "Load Segments CSV".
@@ -32,8 +32,8 @@ def main():
     if selector.exec() != QDialog.DialogCode.Accepted:
         sys.exit(0)
 
-    if selector.selected_module == ModuleSelectorDialog.PSCI_VIEWER:
-        window = PSCIViewer(config, credentials, DEFAULT_PREFIX, username)
+    if selector.selected_module == ModuleSelectorDialog.PCI_VIEWER:
+        window = PCIViewer(config, credentials, DEFAULT_PREFIX, username)
     else:
         window = S3ImageSequenceViewer(config, credentials, DEFAULT_PREFIX, username)
 

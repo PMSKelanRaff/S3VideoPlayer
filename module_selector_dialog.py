@@ -5,7 +5,7 @@ class ModuleSelectorDialog(QDialog):
     """Shown after successful sign-in. Lets the user pick which module to open."""
 
     IMAGE_VIEWER = "image_viewer"
-    PSCI_VIEWER = "psci_viewer"
+    PCI_VIEWER = "pci_viewer"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -22,10 +22,10 @@ class ModuleSelectorDialog(QDialog):
         btn_image_viewer.clicked.connect(lambda: self._select(self.IMAGE_VIEWER))
         layout.addWidget(btn_image_viewer)
 
-        btn_psci_viewer = QPushButton("PSCI Viewer")
-        btn_psci_viewer.setMinimumHeight(40)
-        btn_psci_viewer.clicked.connect(lambda: self._select(self.PSCI_VIEWER))
-        layout.addWidget(btn_psci_viewer)
+        btn_pci_viewer = QPushButton("PCI Viewer")
+        btn_pci_viewer.setMinimumHeight(40)
+        btn_pci_viewer.clicked.connect(lambda: self._select(self.PCI_VIEWER))
+        layout.addWidget(btn_pci_viewer)
 
     def _select(self, module_key: str):
         self.selected_module = module_key
