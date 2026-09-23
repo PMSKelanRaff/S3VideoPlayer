@@ -327,10 +327,6 @@ class PCIViewer(QMainWindow):
             self.map_view = None
             self.map_tabs.addTab(placeholder, "GPS")
 
-        iri_placeholder = QLabel("No IRI data source configured.")
-        iri_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.map_tabs.addTab(iri_placeholder, "IRI")
-
         return self.map_tabs
 
     def _setup_shortcuts(self):
@@ -463,9 +459,14 @@ class PCIViewer(QMainWindow):
         saved = self.observations.get(key)
         self._populate_distress_inputs(saved)
 
-        self._update_map(metadata.get("Lat"), metadata.get("Lng"))
-
         crossed = self._sync_section_pointer(metadata.get("Chainage"))
+        if index == 0 or crossed:
+            # Only refresh the map once per ~100m sample unit (its first frame, or
+            # whenever a new boundary is crossed) instead of on every single frame --
+            # reloading the embedded web view that often during playback is what was
+            # making it visibly redraw/flicker continuously.
+            self._update_map(metadata.get("Lat"), metadata.get("Lng"))
+
         if crossed and self.is_playing:
             self.pause_playback()
             self.status_label.setText(
