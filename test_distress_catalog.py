@@ -2,7 +2,7 @@
 Tests for distress_catalog.py -- the methodology-agnostic distress vocabulary built
 from PCIVariables.txt. These tests must not reference any scoring methodology; how
 a methodology interprets this catalog is that methodology's adapter's concern (see
-test_d6433_adapter.py).
+test_legacy_pci_adapter.py).
 """
 import unittest
 

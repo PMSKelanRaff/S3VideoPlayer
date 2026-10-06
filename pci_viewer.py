@@ -1,19 +1,20 @@
 """
 PCI Viewer.
 
-Lets an inspector step through S3 survey frames and record distress observations
+Lets an inspector step through S3 survey frames, record distress observations
 (distress type, severity, quantity bucket) using the methodology-agnostic vocabulary
-in distress_catalog.py. Named for this project's target methodology (ASTM D6433 PCI),
-but this module does NOT calculate or display a PCI value -- see
-D6433_ARCHITECTURE.md. The ASTM D6433 calculation pipeline
-(inspection_observation.py -> d6433_adapter.py -> d6433_engine.py) exists but remains
-blocked on authoritative D6433 reference data, so no rating is computed or displayed
-here; this viewer only records and exports what the inspector observed.
+in distress_catalog.py, and get a PCI for each ~100m sample unit (one per "Enter"
+commit -- the UI already pauses playback at each sample-unit boundary) using the
+LEGACY VPCI methodology ported from the production C# VPCI_Application -- see
+legacy_pci_engine.py's module docstring for exactly what that is and is not. This
+viewer contains NO calculation logic of its own: selections are translated by
+legacy_pci_adapter.py and scored by legacy_pci_engine.py; this module only displays
+and exports the result.
 
-PSCI (the Irish Rural Flexible Roads Manual scheme this application previously
-implemented) has been removed as a project decision -- this application targets
-ASTM D6433 PCI once the reference data is available, not PSCI. See
-D6433_ARCHITECTURE.md's "PSCI removal" section for what depended on it and why.
+ASTM D6433 PCI and PSCI (the Irish Rural Flexible Roads Manual scheme) were both
+explored as alternative methodologies for this application and have since been
+removed as a project decision -- this module's PCI is the legacy VPCI methodology's
+PCI only.
 """
 import csv
 import os
@@ -34,6 +35,9 @@ from survey_core import parse_rsp_file, S3FrameSource, compute_section_boundarie
 from distress_catalog import (
     DISTRESS_DEFINITIONS, NO_SEVERITY, detailed_field_names, get_distress,
 )
+from legacy_pci_adapter import build_cells_from_labels
+from legacy_pci_engine import calculate_sample_unit_pci, calculate_section_result
+from legacy_pci_provider import StaticLegacyPCIProvider
 
 # Sample units are surveyed in fixed 100m lengths (see compute_section_boundaries).
 SECTION_LENGTH_M = 100.0
@@ -79,8 +83,33 @@ class PCIViewer(QMainWindow):
 
         self.image_keys = []
         self.current_index = -1
-        self.observations = {}         # image key -> dict of distress storage key -> selected bucket label
-        self.observation_dates = {}
+
+        # --- Sample-unit state (NOT frame state) ---
+        # The 17 distress inputs describe one ~100m sample unit, not one frame --
+        # many frames (visited while scrubbing/playing through the video) belong
+        # to the same still-open unit before a boundary is crossed. Everything
+        # below is keyed by `unit_index` (0, 1, 2, ... -- which 100m unit within
+        # the CURRENTLY loaded target; reset whenever a new target is loaded, see
+        # load_selected_qa_segment()), never by frame/image key, so navigating
+        # between frames within one unit never loses what's been entered.
+        #
+        # self.current_unit_index is kept in sync by _load_frame() via
+        # _unit_index_for_chainage() on every navigation (Next/Prev/Skip/
+        # playback/Rerun alike) -- not just on Enter.
+        self.current_unit_index = 0
+        self.unit_selections = {}          # unit_index -> {storage_key: label} -- the LIVE (possibly uncommitted) 17-value state for that unit, updated on every frame change, not just Enter
+        self.unit_observation_dates = {}   # unit_index -> timestamp of its last Enter commit
+        self.last_committed_unit_index = None
+
+        # Legacy VPCI calculation (legacy_pci_engine.py) -- one result per
+        # committed sample unit, keyed the same way as unit_selections above. A
+        # skipped sample unit never calls commit_current_observation(), so it is
+        # simply absent from this dict -- never scored as PCI=0 -- matching the
+        # legacy C# app's "no VPCIData row" semantics exactly, with no
+        # special-casing needed here.
+        self.legacy_provider = StaticLegacyPCIProvider()
+        self.legacy_results = {}       # unit_index -> LegacySampleUnitResult
+
         self.qa_segments = []
         self.full_metadata_list = []
         self.metadata_list = []
@@ -90,7 +119,6 @@ class PCIViewer(QMainWindow):
         # Fixed-length (100m) sample-unit boundaries for the currently loaded target,
         # in absolute chainage metres. Continuous playback auto-pauses at each one.
         self.section_boundaries = []
-        self.next_boundary_index = 0
 
         self.current_fps = 10
         self.play_timer = QTimer(self)
@@ -228,6 +256,18 @@ class PCIViewer(QMainWindow):
         self.btn_enter.clicked.connect(self.commit_current_observation)
         layout.addWidget(self.btn_enter)
 
+        # Legacy VPCI calculation result for the most recently committed sample
+        # unit, plus the running section/road aggregate -- both computed entirely
+        # by legacy_pci_engine.py; this module only formats the display text.
+        self.lbl_sample_unit_result = QLabel("Sample Unit PCI: —")
+        self.lbl_sample_unit_result.setStyleSheet("font-weight: bold;")
+        self.lbl_sample_unit_result.setWordWrap(True)
+        layout.addWidget(self.lbl_sample_unit_result)
+
+        self.lbl_section_result = QLabel("Section vPCI: —")
+        self.lbl_section_result.setWordWrap(True)
+        layout.addWidget(self.lbl_section_result)
+
         controls_layout = QHBoxLayout()
         controls_layout.setSpacing(3)
         self.btn_play = QPushButton(f"▶ Play ({self.current_fps} FPS)")
@@ -260,10 +300,9 @@ class PCIViewer(QMainWindow):
         """Config-driven distress entry grid (vocabulary from distress_catalog.py):
         one dropdown per (distress, severity) cell, matching the Low/Medium/High
         severity-bucket layout the grid was originally built from. Purely records
-        what the inspector selects -- no rating or score is calculated here. Once
-        the D6433 reference data is available, these selections are the raw material
-        an InspectionObservation is built from (see D6433_ARCHITECTURE.md); today
-        they are only stored locally and exported, nothing more."""
+        what the inspector selects -- no rating or score is calculated here;
+        legacy_pci_adapter.py translates these raw selections into legacy_pci_engine.py's
+        input cells (see commit_current_observation())."""
         frame = QFrame()
         grid = QGridLayout(frame)
         grid.setContentsMargins(2, 2, 2, 2)
@@ -417,7 +456,16 @@ class PCIViewer(QMainWindow):
         self.section_boundaries = compute_section_boundaries(
             qa_chainage_from, qa_chainage_to, SECTION_LENGTH_M
         )
-        self.next_boundary_index = 0
+
+        # unit_index is only unique WITHIN a loaded target (it restarts at 0 for
+        # every target), so loading a different target must not carry over the
+        # previous target's sample-unit state -- otherwise e.g. unit 0 of a newly
+        # loaded road would show the previous road's unit 0 selections.
+        self.current_unit_index = 0
+        self.unit_selections = {}
+        self.unit_observation_dates = {}
+        self.last_committed_unit_index = None
+        self.legacy_results = {}
 
         self.field_section.setText(os.path.basename(segment.get('RSPFile', '')))
         self.field_current_project.setText(self.current_project_name)
@@ -439,6 +487,15 @@ class PCIViewer(QMainWindow):
         if index < 0 or index >= len(self.image_keys):
             return
 
+        if self.current_index >= 0:
+            # Stash whatever is currently in the 17 widgets as the OUTGOING
+            # frame's sample unit's live state before anything else changes.
+            # Runs on every navigation (Next/Prev/Skip/playback tick/Rerun
+            # alike), not just on Enter, so in-progress edits are never lost
+            # merely because another frame was loaded within (or even out of)
+            # the same 100m sample unit.
+            self.unit_selections[self.current_unit_index] = self._current_distress_selections()
+
         self.current_index = index
         key = self.image_keys[index]
         filename = key.split('/')[-1]
@@ -456,10 +513,15 @@ class PCIViewer(QMainWindow):
         except Exception as e:
             self.image_label.setText(f"Error loading image:\n{str(e)}")
 
-        saved = self.observations.get(key)
-        self._populate_distress_inputs(saved)
+        new_unit_index = self._unit_index_for_chainage(metadata.get("Chainage"))
+        crossed = new_unit_index != self.current_unit_index
+        self.current_unit_index = new_unit_index
 
-        crossed = self._sync_section_pointer(metadata.get("Chainage"))
+        # Restore (or, for a unit never visited before, default to "0") the 17
+        # widgets for the sample unit this frame now belongs to -- the widgets
+        # are a view onto self.unit_selections, not independent state.
+        self._populate_distress_inputs(self.unit_selections.get(self.current_unit_index))
+
         if index == 0 or crossed:
             # Only refresh the map once per ~100m sample unit (its first frame, or
             # whenever a new boundary is crossed) instead of on every single frame --
@@ -476,18 +538,37 @@ class PCIViewer(QMainWindow):
         else:
             self.status_label.setText(f"Frame {index + 1} of {len(self.image_keys)} | {filename}")
 
-    def _sync_section_pointer(self, chainage):
-        """Advances past any 100m sample-unit boundaries this frame's chainage has
-        now reached. Returns True if at least one boundary was newly crossed."""
+    def _unit_index_for_chainage(self, chainage):
+        """Which 100m sample unit (0-based, within the currently loaded target)
+        a given chainage belongs to: the count of section_boundaries at or
+        before it -- a boundary marks where one unit ends and the next begins.
+        Matches the original playback-pause comparison exactly (`>=`), but,
+        unlike a monotonic running pointer, works correctly for backward
+        navigation too (Left arrow, Rerun), not just forward playback."""
         if chainage is None:
-            return False
+            return self.current_unit_index
+        idx = 0
+        for boundary in self.section_boundaries:
+            if chainage >= boundary:
+                idx += 1
+            else:
+                break
+        if self.section_boundaries:
+            # section_boundaries[i] is the END of unit i, so valid unit indices
+            # are 0..len-1. A chainage exactly AT the final boundary (the last
+            # frame of the whole target) would otherwise count as entering one
+            # past the last real unit -- clamp it back to the true last unit.
+            idx = min(idx, len(self.section_boundaries) - 1)
+        return idx
 
-        crossed = False
-        while (self.next_boundary_index < len(self.section_boundaries)
-               and chainage >= self.section_boundaries[self.next_boundary_index]):
-            self.next_boundary_index += 1
-            crossed = True
-        return crossed
+    def _first_frame_index_for_unit(self, unit_index):
+        """The index (into self.image_keys/self.metadata_list) of the first
+        frame belonging to the given sample unit, or None if that unit has no
+        frames in the currently loaded target."""
+        for i, meta in enumerate(self.metadata_list):
+            if self._unit_index_for_chainage(meta.get("Chainage")) == unit_index:
+                return i
+        return None
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -515,15 +596,26 @@ class PCIViewer(QMainWindow):
             self._load_frame(self.current_index - 1)
 
     def skip_frame(self):
-        """Advance without recording an observation for the current frame."""
+        """Advance without pressing Enter for the current sample unit. Purely a
+        navigation action -- whatever is currently in the widgets is still
+        preserved via _load_frame()'s save-before-leaving step above, so this
+        never discards in-progress distress selections; it only means no
+        legacy_results entry gets created unless/until Enter is pressed."""
         self.next_frame()
 
     def rerun_segment(self):
-        """Replay the current segment from its first frame. Already-saved observations are kept."""
+        """Step back exactly one 100m sample unit from the current position and
+        reopen it for editing: jumps to that unit's first frame and restores
+        whatever selections are currently held for it (committed or not) into
+        the 17 widgets, so the inspector can review/correct it -- pressing
+        Enter again overwrites that unit's committed result."""
         self.pause_playback()
-        self.next_boundary_index = 0
-        if self.image_keys:
-            self._load_frame(0)
+        if not self.image_keys:
+            return
+        target_unit_index = max(0, self.current_unit_index - 1)
+        target_frame_index = self._first_frame_index_for_unit(target_unit_index)
+        if target_frame_index is not None:
+            self._load_frame(target_frame_index)
 
     # ------------------------------------------------------------------
     # Playback
@@ -583,10 +675,10 @@ class PCIViewer(QMainWindow):
         return get_distress(distress_id).storage_key(severity)
 
     def _current_distress_selections(self):
-        """The inspector's raw selections for the current frame -- distress storage
-        key -> selected bucket label. No calculation happens here; see
-        D6433_ARCHITECTURE.md for how this would eventually feed an
-        InspectionObservation once the D6433 reference data is available."""
+        """The inspector's raw, currently-displayed selections -- distress storage
+        key -> selected bucket label -- for whichever sample unit is on screen.
+        No calculation happens here; legacy_pci_adapter.build_cells_from_labels()
+        is the only translation layer into legacy_pci_engine.py."""
         values = {}
         for (distress_id, severity), combo in self.distress_inputs.items():
             storage_key = self._distress_storage_key(distress_id, severity)
@@ -597,12 +689,62 @@ class PCIViewer(QMainWindow):
         if self.current_index < 0 or self.current_index >= len(self.image_keys):
             return
 
-        key = self.image_keys[self.current_index]
-        self.observations[key] = self._current_distress_selections()
-        self.observation_dates[key] = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        unit_index = self.current_unit_index
+        # Snapshot whatever is currently in the widgets as this sample unit's
+        # final, official selections -- overwrites any earlier commit for this
+        # same unit (e.g. after Rerun + edits).
+        self.unit_selections[unit_index] = self._current_distress_selections()
+        self.unit_observation_dates[unit_index] = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+        first_frame = self._first_frame_index_for_unit(unit_index)
+        start_chainage = (self.metadata_list[first_frame].get("Chainage")
+                           if first_frame is not None and first_frame < len(self.metadata_list) else None)
+        sample_unit_id = f"{self.current_project_name or 'unknown'}#{unit_index}" \
+            + (f"@{start_chainage}" if start_chainage is not None else "")
+
+        # legacy_pci_adapter.py is the ONLY translation layer between these raw
+        # selections and legacy_pci_engine.py -- no TDV/q/finalDeduct/PCI
+        # arithmetic happens in this module.
+        cells = build_cells_from_labels(self.unit_selections[unit_index])
+        self.legacy_results[unit_index] = calculate_sample_unit_pci(
+            section_id=self.current_project_name or "unknown",
+            sample_unit_id=sample_unit_id,
+            cells=cells,
+            provider=self.legacy_provider,
+        )
+        self.last_committed_unit_index = unit_index
+        self._update_legacy_pci_display()
 
         if self.chk_play_after_enter.isChecked():
             self.next_frame()
+
+    def _update_legacy_pci_display(self):
+        """Refreshes the sample-unit and section-level legacy PCI labels. All
+        arithmetic is legacy_pci_engine.py's; this method only formats its results
+        for display."""
+        latest = self.legacy_results.get(self.last_committed_unit_index)
+        if latest is None:
+            self.lbl_sample_unit_result.setText("Sample Unit PCI: —")
+        else:
+            self.lbl_sample_unit_result.setText(
+                f"Sample Unit PCI: {latest.pci}  "
+                f"(TDV={latest.total_deduct_value:.1f}, q={latest.q}, "
+                f"maxDeduct={latest.max_deduct_value:.1f}, "
+                f"finalDeduct={latest.final_deduct:.1f})"
+            )
+
+        if not self.legacy_results:
+            self.lbl_section_result.setText("Section vPCI: —")
+            return
+
+        section = calculate_section_result(
+            self.current_project_name or "unknown",
+            [r.pci for r in self.legacy_results.values()],
+        )
+        self.lbl_section_result.setText(
+            f"Section vPCI: {section.vpci}  Rating: {section.rating}  "
+            f"StdDev: {section.standard_deviation}  (n={len(section.sample_unit_pcis)})"
+        )
 
     # ------------------------------------------------------------------
     # GPS map
@@ -627,7 +769,7 @@ class PCIViewer(QMainWindow):
     # Export
     # ------------------------------------------------------------------
     def export_observations(self):
-        if not self.observations:
+        if not self.unit_selections:
             QMessageBox.information(self, "Export Observations", "No frames have been recorded yet.")
             return
 
@@ -645,24 +787,20 @@ class PCIViewer(QMainWindow):
                 writer.writerow(
                     ["Filename", "Frame", "Chainage", "Lat", "Lng", "Alt", "Date",
                      "DistanceFromLastReading(m)"] + detail_fields
+                    + ["PCI", "TDV", "q", "MaxDeduct", "FinalDeduct"]
                 )
 
-                last_written_values = None
+                # One row per 100m sample unit (not per frame) -- each row is
+                # whatever is currently held in self.unit_selections for that
+                # unit, whether or not Enter was ever pressed for it.
                 last_written_chainage = None
-                sorted_keys = sorted(self.observations.keys())
 
-                for key in sorted_keys:
-                    values = self.observations[key]
-                    if values == last_written_values:
-                        continue
+                for unit_index in sorted(self.unit_selections.keys()):
+                    values = self.unit_selections[unit_index]
 
-                    try:
-                        idx = self.image_keys.index(key)
-                        meta = self.metadata_list[idx] if idx < len(self.metadata_list) else {}
-                        frame_num = idx + 1
-                    except ValueError:
-                        meta = {}
-                        frame_num = "N/A"
+                    frame_num = self._first_frame_index_for_unit(unit_index)
+                    meta = (self.metadata_list[frame_num]
+                            if frame_num is not None and frame_num < len(self.metadata_list) else {})
 
                     filename = meta.get("Filename", "")
                     chainage = meta.get("Chainage", 0.0)
@@ -678,12 +816,36 @@ class PCIViewer(QMainWindow):
 
                     if isinstance(chainage, (int, float)):
                         last_written_chainage = chainage
-                    last_written_values = values
+
+                    legacy_result = self.legacy_results.get(unit_index)
+                    if legacy_result is not None:
+                        legacy_fields = [
+                            legacy_result.pci, legacy_result.total_deduct_value,
+                            legacy_result.q, legacy_result.max_deduct_value,
+                            legacy_result.final_deduct,
+                        ]
+                    else:
+                        legacy_fields = ["", "", "", "", ""]
 
                     writer.writerow(
-                        [filename, frame_num, chainage, lat, lng, alt, date_val, dist]
+                        [filename, (frame_num + 1) if frame_num is not None else "N/A",
+                         chainage, lat, lng, alt, date_val, dist]
                         + [values.get(field, "") for field in detail_fields]
+                        + legacy_fields
                     )
+
+                if self.legacy_results:
+                    # Section/road-level aggregate -- legacy_pci_engine.py's
+                    # calculate_section_result(), not recomputed here.
+                    section = calculate_section_result(
+                        self.current_project_name or "unknown",
+                        [r.pci for r in self.legacy_results.values()],
+                    )
+                    writer.writerow([])
+                    writer.writerow([
+                        "Section vPCI", section.vpci, "Rating", section.rating,
+                        "Standard Deviation", section.standard_deviation,
+                    ])
 
                 current_date = datetime.datetime.now().strftime("%d/%m/%Y")
                 writer.writerow([f"{self.username} - {current_date}"])
