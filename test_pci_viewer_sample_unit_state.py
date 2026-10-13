@@ -234,15 +234,14 @@ class TestSectionAggregationUsesLatestResultOnce(unittest.TestCase):
 class TestSkippedUnitsRemainExcluded(unittest.TestCase):
     """Test G."""
 
-    def test_skipping_through_a_unit_without_enter_leaves_it_out_of_results(self):
+    def test_skipping_a_unit_without_enter_leaves_it_out_of_results(self):
         viewer = _make_viewer()
         _three_unit_target(viewer)
         key = _first_distress_key(viewer)
         combo = viewer.distress_inputs[key]
 
         combo.setCurrentIndex(3)  # entered but never committed for unit 0
-        for _ in range(10):  # skip through unit 0's frames into unit 1
-            viewer.skip_frame()
+        viewer.skip_frame()  # one press -- jumps straight to unit 1's first frame
         self.assertEqual(viewer.current_unit_index, 1)
 
         viewer.commit_current_observation()  # only unit 1 committed
@@ -250,6 +249,24 @@ class TestSkippedUnitsRemainExcluded(unittest.TestCase):
         self.assertNotIn(0, viewer.legacy_results, "a skipped (never-Entered) unit must not appear in legacy_results")
         self.assertIn(1, viewer.legacy_results)
         self.assertEqual(len(viewer.legacy_results), 1)
+
+    def test_skip_jumps_a_whole_100m_unit_not_one_frame(self):
+        viewer = _make_viewer()
+        _three_unit_target(viewer)
+
+        self.assertEqual(viewer.current_index, 0)
+        viewer.skip_frame()
+        self.assertEqual(viewer.current_unit_index, 1)
+        self.assertEqual(viewer.current_index, viewer._first_frame_index_for_unit(1))
+
+    def test_skip_at_the_last_unit_advances_to_the_final_frame(self):
+        viewer = _make_viewer()
+        _three_unit_target(viewer)
+
+        viewer._load_frame(25)  # unit 2, the last unit
+        self.assertEqual(viewer.current_unit_index, 2)
+        viewer.skip_frame()
+        self.assertEqual(viewer.current_index, len(viewer.image_keys) - 1)
 
 
 if __name__ == "__main__":

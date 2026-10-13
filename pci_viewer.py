@@ -596,12 +596,25 @@ class PCIViewer(QMainWindow):
             self._load_frame(self.current_index - 1)
 
     def skip_frame(self):
-        """Advance without pressing Enter for the current sample unit. Purely a
-        navigation action -- whatever is currently in the widgets is still
-        preserved via _load_frame()'s save-before-leaving step above, so this
-        never discards in-progress distress selections; it only means no
-        legacy_results entry gets created unless/until Enter is pressed."""
-        self.next_frame()
+        """Advance a full 100m sample unit forward without pressing Enter for the
+        current one: jumps to the NEXT unit's first frame (not just the next
+        single frame). Purely a navigation action -- whatever is currently in
+        the widgets is still preserved via _load_frame()'s save-before-leaving
+        step above, so this never discards in-progress distress selections; it
+        only means no legacy_results entry gets created for the skipped unit
+        unless/until Enter is pressed for it."""
+        if not self.image_keys:
+            return
+        target_unit_index = self.current_unit_index + 1
+        target_frame_index = self._first_frame_index_for_unit(target_unit_index)
+        if target_frame_index is not None:
+            self._load_frame(target_frame_index)
+        else:
+            # No further unit in this target -- nothing left to skip to;
+            # advance to the final frame instead of doing nothing.
+            last_index = len(self.image_keys) - 1
+            if last_index > self.current_index:
+                self._load_frame(last_index)
 
     def rerun_segment(self):
         """Step back exactly one 100m sample unit from the current position and
