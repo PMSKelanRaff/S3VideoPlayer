@@ -15,6 +15,14 @@ ASTM D6433 PCI and PSCI (the Irish Rural Flexible Roads Manual scheme) were both
 explored as alternative methodologies for this application and have since been
 removed as a project decision -- this module's PCI is the legacy VPCI methodology's
 PCI only.
+
+Two ways to load a target to rate: "New Project (from StartEnds.xlsx)" (builds a
+brand new project .accdb via project_setup.py, then loads it) and "Load Project
+(.accdb)" (opens an existing one) -- both via project_loader.py. Either way,
+committing an observation writes InputData/VPCIData into that project's own
+.accdb as you rate, matching the old C# app's own persistence (see
+commit_current_observation()). Export CSV remains available as an additional,
+separate output alongside the database writes, not a replacement for them.
 """
 import csv
 import os
@@ -24,7 +32,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QMessageBox, QFileDialog, QSizePolicy,
     QSlider, QComboBox, QFrame, QCheckBox, QTabWidget, QLineEdit,
-    QToolBar, QApplication
+    QToolBar, QApplication, QInputDialog
 )
 from PyQt6.QtGui import QPixmap, QShortcut, QKeySequence
 from PyQt6.QtCore import Qt, QTimer
@@ -38,6 +46,8 @@ from distress_catalog import (
 from legacy_pci_adapter import build_cells_from_labels
 from legacy_pci_engine import calculate_sample_unit_pci, calculate_section_result
 from legacy_pci_provider import StaticLegacyPCIProvider
+import project_loader
+import project_setup
 
 # Sample units are surveyed in fixed 100m lengths (see compute_section_boundaries).
 SECTION_LENGTH_M = 100.0
@@ -119,6 +129,15 @@ class PCIViewer(QMainWindow):
         # Fixed-length (100m) sample-unit boundaries for the currently loaded target,
         # in absolute chainage metres. Continuous playback auto-pauses at each one.
         self.section_boundaries = []
+        self.current_segment_chainage_from_m = 0.0
+
+        # Set once a project .accdb is loaded (via New Project or Load Project)
+        # -- commit_current_observation() writes InputData/VPCIData into this
+        # same .accdb as you rate (see project_loader.py), in addition to the
+        # existing in-memory legacy_results/CSV-export path.
+        self.current_accdb_path = None
+        self.current_segment_project_data_id = None
+        self.current_segment_identifier = None
 
         self.current_fps = 10
         self.play_timer = QTimer(self)
@@ -161,10 +180,15 @@ class PCIViewer(QMainWindow):
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
 
-        btn_load_csv = QPushButton("Load FileExtentsAWS.csv")
-        btn_load_csv.setStyleSheet("background-color: #1976d2; color: white; font-weight: bold; padding: 6px;")
-        btn_load_csv.clicked.connect(self.load_qa_csv)
-        toolbar.addWidget(btn_load_csv)
+        btn_new_project = QPushButton("New Project (from StartEnds.xlsx)…")
+        btn_new_project.setStyleSheet("background-color: #1976d2; color: white; font-weight: bold; padding: 6px;")
+        btn_new_project.clicked.connect(self.create_and_load_new_project)
+        toolbar.addWidget(btn_new_project)
+
+        btn_load_project = QPushButton("Load Project (.accdb)…")
+        btn_load_project.setStyleSheet("background-color: #4527a0; color: white; font-weight: bold; padding: 6px;")
+        btn_load_project.clicked.connect(self.load_project_accdb)
+        toolbar.addWidget(btn_load_project)
 
         self.qa_combo = QComboBox()
         self.qa_combo.setMinimumWidth(280)
@@ -193,7 +217,7 @@ class PCIViewer(QMainWindow):
         self.field_length = self._add_info_field(grid, 1, 4, "Length:")
         self.field_image_info = self._add_info_field(grid, 1, 6, "Image Info:")
 
-        self.fps_label = QLabel(f"Video Speed: {self.current_fps} FPS")
+        self.fps_label = QLabel(f"Speed: {self.current_fps}")
         grid.addWidget(self.fps_label, 0, 8)
         self.fps_slider = QSlider(Qt.Orientation.Horizontal)
         self.fps_slider.setMinimum(1)
@@ -270,7 +294,7 @@ class PCIViewer(QMainWindow):
 
         controls_layout = QHBoxLayout()
         controls_layout.setSpacing(3)
-        self.btn_play = QPushButton(f"▶ Play ({self.current_fps} FPS)")
+        self.btn_play = QPushButton("▶ Play")
         self.btn_play.setStyleSheet("font-weight: bold; background-color: #2e7d32; color: white;")
         self.btn_play.clicked.connect(self.toggle_playback)
         self.btn_pause = QPushButton("Pause")
@@ -377,34 +401,92 @@ class PCIViewer(QMainWindow):
     # ------------------------------------------------------------------
     # Segment / frame loading (mirrors the Image Viewer's QA workflow)
     # ------------------------------------------------------------------
-    def load_qa_csv(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select QA Segments CSV", "", "CSV Files (*.csv)")
+    def _load_segments_into_combo(self, accdb_path, segments, success_message):
+        """Shared by load_project_accdb() and create_and_load_new_project() --
+        both end up with the same thing: a project .accdb and its
+        project_loader.load_project_segments() result, ready to populate the
+        combo box and load the first target, same as the old CSV flow did."""
+        self.qa_segments.clear()
+        self.qa_combo.clear()
+        self.current_accdb_path = accdb_path
+
+        for segment in segments:
+            self.qa_segments.append(segment)
+            fname = os.path.basename(segment.get('RSPFile', 'Unknown RSP'))
+            c_from = segment.get('ChainageFrom', '0')
+            c_to = segment.get('ChainageTo', '0')
+            self.qa_combo.addItem(f"{fname} ({c_from} to {c_to} km)")
+
+        QMessageBox.information(self, "Success", success_message)
+
+        # Load the first target immediately so there's no extra button press to see
+        # something on screen. Switching targets afterwards still requires an explicit
+        # "Load Selected Target" click, so an accidental combo-box change can't silently
+        # discard in-progress observations.
+        if self.qa_combo.count() > 0:
+            self.load_selected_qa_segment()
+
+    def load_project_accdb(self):
+        """Opens an EXISTING project .accdb (created earlier by
+        create_and_load_new_project(), or by hand via project_setup.py) --
+        one combo-box entry per ProjectData row, via
+        project_loader.load_project_segments(). Committing an observation
+        writes InputData/VPCIData back into this same .accdb (see
+        commit_current_observation())."""
+        path, _ = QFileDialog.getOpenFileName(self, "Select Project Database", "", "Access Database (*.accdb)")
         if not path:
             return
 
         try:
-            self.qa_segments.clear()
-            self.qa_combo.clear()
+            segments = project_loader.load_project_segments(path)
+        except project_loader.ProjectLoadError as e:
+            QMessageBox.critical(self, "Error Loading Project", str(e))
+            return
 
-            with open(path, 'r', encoding='utf-8-sig') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    self.qa_segments.append(row)
-                    fname = os.path.basename(row.get('RSPFile', 'Unknown RSP'))
-                    c_from = row.get('ChainageFrom', '0')
-                    c_to = row.get('ChainageTo', '0')
-                    self.qa_combo.addItem(f"{fname} ({c_from} to {c_to} km)")
+        self._load_segments_into_combo(path, segments, f"Loaded {len(segments)} project segments.")
 
-            QMessageBox.information(self, "Success", f"Loaded {len(self.qa_segments)} QA segments.")
+    def create_and_load_new_project(self):
+        """Builds a brand NEW project .accdb from a StartEnds.xlsx (the
+        validated start/end chainages for a job -- see project_setup.py's
+        setup_project_from_request(): locates the job's RSP folder and S3
+        prefix automatically from the xlsx path itself) and immediately loads
+        it for rating, same as load_project_accdb() does for an existing one."""
+        xlsx_path, _ = QFileDialog.getOpenFileName(self, "Select StartEnds.xlsx", "", "Excel Files (*.xlsx)")
+        if not xlsx_path:
+            return
 
-            # Load the first target immediately so there's no extra button press to see
-            # something on screen. Switching targets afterwards still requires an explicit
-            # "Load Selected Target" click, so an accidental combo-box change can't silently
-            # discard in-progress observations.
-            if self.qa_combo.count() > 0:
-                self.load_selected_qa_segment()
+        file_description, ok = QInputDialog.getText(self, "New Project", "Short description for this project:")
+        if not ok or not file_description.strip():
+            return
+
+        output_path, _ = QFileDialog.getSaveFileName(self, "Save New Project Database As", "", "Access Database (*.accdb)")
+        if not output_path:
+            return
+        if not output_path.lower().endswith(".accdb"):
+            output_path += ".accdb"
+
+        self.status_label.setText("Building new project database...")
+        QApplication.processEvents()
+
+        try:
+            project_setup.setup_project_from_request(
+                start_ends_xlsx=xlsx_path,
+                output_db_path=output_path,
+                file_description=file_description.strip(),
+            )
         except Exception as e:
-            QMessageBox.critical(self, "Error Loading QA CSV", f"Failed to read CSV:\n{e}")
+            QMessageBox.critical(self, "Error Building Project", f"Could not build the project database:\n{e}")
+            return
+
+        try:
+            segments = project_loader.load_project_segments(output_path)
+        except project_loader.ProjectLoadError as e:
+            QMessageBox.critical(self, "Error Loading Project", str(e))
+            return
+
+        self._load_segments_into_combo(
+            output_path, segments, f"Built and loaded new project with {len(segments)} segment(s)."
+        )
 
     def load_selected_qa_segment(self):
         idx = self.qa_combo.currentIndex()
@@ -412,6 +494,13 @@ class PCIViewer(QMainWindow):
             return
 
         segment = self.qa_segments[idx]
+
+        # Present only for a segment loaded via Load Project (.accdb) --
+        # absent (None) for a CSV-loaded segment, which has no project .accdb
+        # to write ratings back into.
+        self.current_segment_project_data_id = segment.get('_project_data_id')
+        self.current_segment_identifier = segment.get('_identifier')
+
         image0 = segment.get('Image0', '')
 
         if "://" in image0:
@@ -429,6 +518,8 @@ class PCIViewer(QMainWindow):
         except ValueError:
             qa_chainage_from = 0.0
             qa_chainage_to = 9999999.0
+
+        self.current_segment_chainage_from_m = qa_chainage_from
 
         rsp_path = segment.get('RSPFile', '')
         if not os.path.exists(rsp_path):
@@ -570,6 +661,18 @@ class PCIViewer(QMainWindow):
                 return i
         return None
 
+    def _unit_chainage_range_km(self, unit_index):
+        """(from_km, to_km) for the given sample unit, in the currently loaded
+        target -- section_boundaries[i] is the END chainage (metres) of unit i,
+        so a unit's start is the previous unit's boundary (or the target's own
+        start chainage, for unit 0)."""
+        start_m = (
+            self.section_boundaries[unit_index - 1] if unit_index > 0
+            else self.current_segment_chainage_from_m
+        )
+        end_m = self.section_boundaries[unit_index]
+        return start_m / 1000.0, end_m / 1000.0
+
     def showEvent(self, event):
         super().showEvent(event)
         self._update_image_display()
@@ -636,9 +739,9 @@ class PCIViewer(QMainWindow):
     def _update_fps(self, value):
         self.current_fps = value
         self.play_timer.setInterval(int(1000 / self.current_fps))
-        self.fps_label.setText(f"Video Speed: {self.current_fps} FPS")
+        self.fps_label.setText(f"Speed: {self.current_fps}")
         if not self.is_playing:
-            self.btn_play.setText(f"▶ Play ({self.current_fps} FPS)")
+            self.btn_play.setText("▶ Play")
 
     def toggle_playback(self):
         if self.is_playing:
@@ -657,7 +760,7 @@ class PCIViewer(QMainWindow):
         if self.is_playing:
             self.play_timer.stop()
             self.is_playing = False
-            self.btn_play.setText(f"▶ Play ({self.current_fps} FPS)")
+            self.btn_play.setText("▶ Play")
             self.btn_play.setStyleSheet("font-weight: bold; background-color: #2e7d32; color: white;")
 
     def _auto_advance_frame(self):
@@ -719,14 +822,38 @@ class PCIViewer(QMainWindow):
         # selections and legacy_pci_engine.py -- no TDV/q/finalDeduct/PCI
         # arithmetic happens in this module.
         cells = build_cells_from_labels(self.unit_selections[unit_index])
-        self.legacy_results[unit_index] = calculate_sample_unit_pci(
+        result = calculate_sample_unit_pci(
             section_id=self.current_project_name or "unknown",
             sample_unit_id=sample_unit_id,
             cells=cells,
             provider=self.legacy_provider,
         )
+        self.legacy_results[unit_index] = result
         self.last_committed_unit_index = unit_index
         self._update_legacy_pci_display()
+
+        # Only present for a target loaded via Load Project (.accdb) -- a
+        # CSV-loaded target has no project database to write into, and keeps
+        # behaving exactly as before (in-memory + CSV export only).
+        if self.current_accdb_path and self.current_segment_project_data_id is not None:
+            unit_chainage_from_km, unit_chainage_to_km = self._unit_chainage_range_km(unit_index)
+            try:
+                project_loader.commit_rated_sample_unit(
+                    self.current_accdb_path,
+                    self.current_segment_project_data_id,
+                    self.current_segment_identifier,
+                    unit_chainage_from_km=unit_chainage_from_km,
+                    unit_chainage_to_km=unit_chainage_to_km,
+                    selections=self.unit_selections[unit_index],
+                    result=result,
+                )
+            except Exception as e:
+                QMessageBox.critical(
+                    self, "Error Saving to Project Database",
+                    f"This sample unit's PCI was calculated but could not be saved to the "
+                    f"project database:\n{e}\n\nYour in-progress selections are still safe in "
+                    f"this session -- press Enter again to retry the save."
+                )
 
         if self.chk_play_after_enter.isChecked():
             self.next_frame()
